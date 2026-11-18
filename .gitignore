@@ -1,0 +1,9 @@
+.DS_Store
+.mimocode/
+
+# Swift / Xcode
+.build/
+DerivedData/
+xcuserdata/
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
