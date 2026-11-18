@@ -68,6 +68,8 @@ struct QueueItem: Codable, Equatable {
     var bytesPerSecond: Double
     /// 文件名含 GBK 不可表示字符，已自动兼容命名
     var needsNameMapping: Bool
+    /// 相同文件判定后跳过上传的原因（completed 且非空 = 未实际传输）
+    var skippedReason: String?
     /// 一次批量入队的分组 id（全部完成后发整队完成通知）
     var batchId: String
     var addedAt: Date
@@ -95,6 +97,7 @@ struct QueueItem: Codable, Equatable {
         self.bytes = 0
         self.bytesPerSecond = 0
         self.needsNameMapping = false
+        self.skippedReason = nil
         self.batchId = batchId
         self.addedAt = addedAt
         self.finishedAt = nil

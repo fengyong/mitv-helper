@@ -16,17 +16,34 @@ public enum NameCodec {
         return String(data: data, encoding: gbkEncoding) == name
     }
 
-    /// 显示名 → 远端名。规则：
-    /// 1. 纯 ASCII → 原样
-    /// 2. GBK 可表示 → 原样（引擎负责以 GBK 编码发送）
-    /// 3. 不可表示（emoji 等）→ 逐字符替换为 "-"，并标记 needsMapping
+    /// 显示名 → 远端名。规则（尽可能保留原名）：
+    /// 1. GBK 可表示且文件系统安全的字符 → 原样
+    /// 2. 不安全字符（emoji 等 GBK 不可表示、路径/通配/引号等风险字符、控制字符）→ 替换为 "-"
+    /// 3. 去首部空格、去尾部空格/点（FAT32/exFAT 要求）
+    /// needsMapping = 名字发生过任何改写
     public static func remoteName(for displayName: String) -> (remote: String, needsMapping: Bool) {
-        guard !isGBKRepresentable(displayName) else { return (displayName, false) }
         var out = ""
         for ch in displayName {
-            out += isGBKRepresentable(String(ch)) ? String(ch) : "-"
+            if isSafeRemoteChar(ch) {
+                out.append(ch)
+            } else {
+                out.append("-")
+            }
         }
-        return (out, true)
+        var trimmed = out
+        while let f = trimmed.first, f == " " { trimmed.removeFirst() }
+        while let l = trimmed.last, l == " " || l == "." { trimmed.removeLast() }
+        if trimmed.isEmpty { trimmed = "file" } // 整名都是特殊字符的兜底
+        return (trimmed, trimmed != displayName)
+    }
+
+    /// 远端文件名安全字符判定
+    private static func isSafeRemoteChar(_ ch: Character) -> Bool {
+        let scalars = Array(ch.unicodeScalars)
+        guard scalars.count == 1 else { return false } // 组合字符序列一律替换
+        if scalars[0].value < 0x20 || scalars[0].value == 0x7F { return false } // 控制字符
+        if "/\\:*?\"<>|".contains(ch) { return false } // 文件系统风险字符
+        return isGBKRepresentable(String(ch))
     }
 
     /// 重名冲突：a.mp4 → a (2).mp4 → a (3).mp4

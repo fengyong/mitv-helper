@@ -257,6 +257,33 @@ public final class SwiftFTPEngine: TransferEngine {
         }, completion: completion)
     }
 
+    /// 读远端文件前 maxBytes 字节：RETR 后读够即断（不等到 EOF，226/426 由 QUIT 吸收）
+    public func downloadPrefix(_ endpoint: FTPEndpoint, remotePath: String, maxBytes: Int,
+                               completion: @escaping (Result<Data, Error>) -> Void) {
+        run({ () -> Data in
+            return try self.withConnection(endpoint) { conn -> Data in
+                let data = try conn.beginTransfer(cmd: "RETR", path: FTPPath.normalize(remotePath))
+                do {
+                    var acc = [UInt8]()
+                    acc.reserveCapacity(maxBytes)
+                    var buf = [UInt8](repeating: 0, count: 65536)
+                    var remain = maxBytes
+                    while remain > 0 {
+                        let n = try data.read(&buf, maxCount: min(buf.count, remain))
+                        if n == 0 { break } // 文件先于请求长度结束
+                        acc.append(contentsOf: buf[0..<n])
+                        remain -= n
+                    }
+                    data.closeNow() // 读够即断：服务器自行终止传输
+                    return Data(acc)
+                } catch {
+                    data.closeNow()
+                    throw error
+                }
+            }
+        }, completion: completion)
+    }
+
     public func delete(_ endpoint: FTPEndpoint, remotePath: String, completion: @escaping (Error?) -> Void) {
         run({ () -> Void in
             try self.withConnection(endpoint) { conn in

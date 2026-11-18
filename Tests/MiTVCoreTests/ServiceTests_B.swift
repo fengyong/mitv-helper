@@ -12,6 +12,7 @@ enum ServiceTests_B {
         testSoftDeletePolicy()
         testTVStoreRoundTrip()
         testQueueServiceIntegration()
+        testUploadCollision()
     }
 
     // MARK: - 队列状态机
@@ -142,6 +143,10 @@ enum ServiceTests_B {
 
         let r3 = SmartRouting.remoteTarget(displayName: "b.mp4", dir: "/", existingNames: [])
         assertEqual(r3.path, "/b.mp4", "根目录路径无重复斜杠")
+
+        // 同名不同内容 → 原名 + md5 前 8 位
+        assertEqual(SmartRouting.md5SuffixedName("a.mp4", digest8: "1b2c3d4e"), "a-1b2c3d4e.mp4", "md5 后缀名")
+        assertEqual(SmartRouting.md5SuffixedName("无扩展名", digest8: "1b2c3d4e"), "无扩展名-1b2c3d4e", "无扩展名 md5 后缀")
     }
 
     // MARK: - 软删除决策表（§7 三分支）
@@ -225,7 +230,14 @@ enum ServiceTests_B {
         /// true 时 upload 以失败收场
         var failUploads = false
         var pendingUploadCompletions: [(Result<Int64, Error>) -> Void] = []
+        /// list 返回的目录内容（重名判定测试用）
+        var dirEntries: [FTPFileEntry] = [FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true)]
+        /// downloadPrefix 返回的「远端前缀」内容（nil → 失败）
+        var remotePrefix: Data?
+        private var prefixCallCount = 0
         private let lock = NSLock()
+
+        var prefixCalls: Int { lock.lock(); defer { lock.unlock() }; return prefixCallCount }
 
         func releaseAllUploads(_ result: Result<Int64, Error>) {
             lock.lock(); let cbs = pendingUploadCompletions; pendingUploadCompletions = []; lock.unlock()
@@ -249,7 +261,18 @@ enum ServiceTests_B {
         func ping(_ endpoint: FTPEndpoint, completion: @escaping (Error?) -> Void) { DispatchQueue.global().async { completion(nil) } }
         func list(_ endpoint: FTPEndpoint, path: String, completion: @escaping (Result<[FTPFileEntry], Error>) -> Void) {
             DispatchQueue.global().async {
-                completion(.success([FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true)]))
+                completion(.success(self.dirEntries))
+            }
+        }
+        func downloadPrefix(_ endpoint: FTPEndpoint, remotePath: String, maxBytes: Int,
+                            completion: @escaping (Result<Data, Error>) -> Void) {
+            lock.lock()
+            prefixCallCount += 1
+            let data = remotePrefix
+            lock.unlock()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.02) {
+                if let d = data { completion(.success(d)) }
+                else { completion(.failure(EngineError.ioError("无预置前缀"))) }
             }
         }
         func upload(_ endpoint: FTPEndpoint, from localURL: URL, to remotePath: String, resume: Bool,
@@ -354,5 +377,117 @@ enum ServiceTests_B {
         let restoredItem = restored.snapshot().first { $0.phase == .queued }
         assertTrue(restoredItem != nil, "running 项恢复为 queued（等待续传）")
         assertEqual(restoredItem?.displayName, f1.lastPathComponent, "恢复项信息完整")
+    }
+}
+
+// MARK: - 上传重名判定（净化 / 相同文件跳过 / 不同文件 MD5 后缀改名）
+
+extension ServiceTests_B {
+
+    static func testUploadCollision() {
+        print("· 上传重名判定")
+        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-collide-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let caps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
+                                mkdir: false, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+
+        // 本地素材：4096 字节 0xAB（<10MB → 指纹 = 全文件 md5）
+        let content = Data(repeating: 0xAB, count: 4096)
+        let f1 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-collide-\(UUID().uuidString).mp4")
+        try! content.write(to: f1)
+        defer { try? FileManager.default.removeItem(at: f1) }
+        let fname = f1.lastPathComponent
+        let localFP = FileDigest.fingerprint(url: f1, fileSize: Int64(content.count))!
+        let digest8 = String(localFP.hex.prefix(8))
+        let moviesDir = FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true)
+        let clashEntry = FTPFileEntry(path: "/Movies/" + fname, name: fname, isDirectory: false, size: Int64(content.count))
+
+        // 1) 同名 + 同尺寸 + 同前缀 → 相同文件，跳过上传
+        do {
+            let engine = InlineEngine()
+            engine.dirEntries = [moviesDir, clashEntry]
+            engine.remotePrefix = content // 远端前缀与本地内容一致
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("same"),
+                                     concurrency: 1, resumeOnStart: true)
+            queue.addUploads([f1])
+            waitUntil("同名相同文件 → 跳过") { queue.snapshot().first?.phase == .completed }
+            let it = queue.snapshot().first!
+            assertTrue(it.skippedReason != nil, "跳过原因已记录")
+            assertEqual(engine.uploadCalls.count, 0, "相同文件不发起上传")
+            assertEqual(engine.prefixCalls, 1, "同尺寸 → 拉一次远端前缀")
+        }
+
+        // 2) 同名 + 同尺寸 + 不同前缀 → 改名（原名-md5前8）上传
+        do {
+            let engine = InlineEngine()
+            engine.dirEntries = [moviesDir, clashEntry]
+            engine.remotePrefix = Data(repeating: 0x11, count: content.count) // 同尺寸不同内容
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("diff"),
+                                     concurrency: 1, resumeOnStart: true)
+            queue.addUploads([f1])
+            waitUntil("同名不同文件 → 改名上传") { queue.snapshot().first?.phase == .completed }
+            let it = queue.snapshot().first!
+            assertTrue(it.skippedReason == nil, "不同文件不跳过")
+            assertEqual(engine.uploadCalls.count, 1, "发起一次上传")
+            assertEqual(engine.uploadCalls.first?.remotePath,
+                        "/Movies/" + SmartRouting.md5SuffixedName(fname, digest8: digest8),
+                        "远端名 = 原名-指纹8.mp4")
+        }
+
+        // 3) 同名但尺寸不同 → 免拉前缀，直接改名上传
+        do {
+            let engine = InlineEngine()
+            engine.dirEntries = [moviesDir, FTPFileEntry(path: "/Movies/" + fname, name: fname,
+                                                         isDirectory: false, size: Int64(content.count) + 1)]
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("sizediff"),
+                                     concurrency: 1, resumeOnStart: true)
+            queue.addUploads([f1])
+            waitUntil("同名尺寸不同 → 改名上传") { queue.snapshot().first?.phase == .completed }
+            assertEqual(engine.prefixCalls, 0, "尺寸不同免拉前缀")
+            assertEqual(engine.uploadCalls.count, 1, "发起一次上传")
+            assertEqual(engine.uploadCalls.first?.remotePath,
+                        "/Movies/" + SmartRouting.md5SuffixedName(fname, digest8: digest8),
+                        "尺寸不同也用指纹后缀")
+        }
+
+        // 4) 远端前缀读取失败 → 判定不了 → 保守改名上传（不覆盖）
+        do {
+            let engine = InlineEngine()
+            engine.dirEntries = [moviesDir, clashEntry]
+            engine.remotePrefix = nil
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("failfetch"),
+                                     concurrency: 1, resumeOnStart: true)
+            queue.addUploads([f1])
+            waitUntil("前缀拉取失败 → 保守改名") { queue.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.count, 1, "保守改名上传")
+            assertEqual(engine.uploadCalls.first?.remotePath,
+                        "/Movies/" + SmartRouting.md5SuffixedName(fname, digest8: digest8),
+                        "判定失败不覆盖远端")
+        }
+
+        // 5) 指纹名已存在且内容相同（同一内容此前已传过）→ 跳过，不再堆积 (2)(3)
+        do {
+            let engine = InlineEngine()
+            let candName = SmartRouting.md5SuffixedName(fname, digest8: digest8)
+            engine.dirEntries = [moviesDir,
+                                 FTPFileEntry(path: "/Movies/" + fname, name: fname, isDirectory: false,
+                                              size: Int64(content.count) + 1), // 同名但尺寸不同 → 第一层判不同
+                                 FTPFileEntry(path: "/Movies/" + candName, name: candName, isDirectory: false,
+                                              size: Int64(content.count))]     // 指纹名内容与本地一致
+            engine.remotePrefix = content
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("converge"),
+                                     concurrency: 1, resumeOnStart: true)
+            queue.addUploads([f1])
+            waitUntil("指纹名命中相同内容 → 跳过收敛") { queue.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.count, 0, "不重复上传（不堆 (2)(3)）")
+            let it = queue.snapshot().first!
+            assertTrue(it.skippedReason != nil, "收敛为跳过")
+            assertEqual(it.remotePath, "/Movies/" + candName, "跳过指向已有指纹文件")
+        }
     }
 }

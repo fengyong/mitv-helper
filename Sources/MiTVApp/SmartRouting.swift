@@ -33,4 +33,12 @@ enum SmartRouting {
     static func existingNames(entries: [FTPFileEntry]) -> Set<String> {
         Set(entries.map { $0.name })
     }
+
+    /// 同名不同内容的兜底名：stem-<md5 前 8 位>.ext
+    /// （指纹=文件前 min(大小,10MB) 字节的 md5——小文件即全文件 md5，大文件前 10M 指纹）
+    static func md5SuffixedName(_ name: String, digest8: String) -> String {
+        let stem = (name as NSString).deletingPathExtension
+        let ext = (name as NSString).pathExtension
+        return ext.isEmpty ? "\(stem)-\(digest8)" : "\(stem)-\(digest8).\(ext)"
+    }
 }

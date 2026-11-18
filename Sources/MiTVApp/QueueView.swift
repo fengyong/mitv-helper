@@ -484,7 +484,8 @@ final class QueueCardView: NSView {
             progress.fraction = 1
             progress.barColor = .systemGreen
             statusLabel.textColor = .secondaryLabelColor
-            statusLabel.stringValue = item.direction == .upload ? "已送到电视" : "已保存到本地"
+            statusLabel.stringValue = item.skippedReason
+                ?? (item.direction == .upload ? "已送到电视" : "已保存到本地")
         case .canceled:
             progress.isHidden = false
             progress.fraction = item.sizeBytes > 0 ? Double(item.bytes) / Double(item.sizeBytes) : 0

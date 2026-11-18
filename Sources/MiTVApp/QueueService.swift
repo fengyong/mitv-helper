@@ -329,7 +329,7 @@ final class QueueService {
         }
     }
 
-    /// 智能分流第二步：目标目录列表 → 唯一化远端路径 → 起传
+    /// 智能分流第二步：目标目录列表 → 净化命名 / 同名判定（相同文件跳过，不同文件加 MD5 后缀）→ 起传
     private func finalizeUploadRouting(_ id: String, dir: String,
                                        dirEntries: Result<[FTPFileEntry], Error>, handle: TransferHandle) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
@@ -345,13 +345,123 @@ final class QueueService {
                   let p = other.remotePath else { return nil }
             return (p as NSString).lastPathComponent
         })
-        let existing = SmartRouting.existingNames(entries: dirList).union(inflight)
-        let target = SmartRouting.remoteTarget(displayName: items[idx].displayName,
-                                               dir: dir,
-                                               existingNames: existing)
+        let mapped = NameCodec.remoteName(for: items[idx].displayName)
+        // 磁盘上已有同名文件 → 「相同文件」判定（尺寸 → 前 10MB 指纹）
+        if let clash = dirList.first(where: { !$0.isDirectory && $0.name == mapped.remote }) {
+            decideSameFileOrSuffix(id, dir: dir, proposedName: mapped.remote, needsMapping: mapped.needsMapping,
+                                   clash: clash, dirList: dirList, inflight: inflight, handle: handle)
+            return
+        }
+        beginUpload(id, dir: dir, remoteName: mapped.remote, needsMapping: mapped.needsMapping,
+                    dirList: dirList, inflight: inflight, handle: handle)
+    }
+
+    /// 同名冲突判定：远端是相同文件 → 跳过上传；不同文件（或判定不了）→ 原名后加内容指纹改名；
+    /// 指纹名若也被占用，对它再做一次相同判定（同一内容此前已传过 → 跳过，不堆积 (2)(3)）
+    private func decideSameFileOrSuffix(_ id: String, dir: String, proposedName: String, needsMapping: Bool,
+                                        clash: FTPFileEntry, dirList: [FTPFileEntry], inflight: Set<String>,
+                                        handle: TransferHandle) {
+        func stillConnecting(_ id: String) -> Bool {
+            guard let idx = items.firstIndex(where: { $0.id == id }) else { return false }
+            return items[idx].phase == .connecting
+        }
+        guard stillConnecting(id) else { return }
+        let localSize = items.first(where: { $0.id == id })!.sizeBytes
+        let localURL = items.first(where: { $0.id == id })!.localURL
+
+        // 本地指纹（后台计算，回调在后台队列、由下方 hop 回 stateQ）——前 min(size,10MB) 字节，巨大文件也秒级
+        FileDigest.fingerprintAsync(url: localURL, fileSize: localSize) { [weak self] localHex, prefixLen in
+            guard let self = self else { return }
+            self.stateQ.async {
+                guard stillConnecting(id) else { return }
+                guard let localHex = localHex, let prefixLen = prefixLen else {
+                    self.finishWithEngineError(id: id, error: EngineError.ioError("无法读取本地文件指纹：\(localURL.lastPathComponent)"))
+                    return
+                }
+                let digest8 = String(localHex.prefix(8))
+                let candidate = SmartRouting.md5SuffixedName(proposedName, digest8: digest8)
+
+                // 第二层：指纹名已存在 → 对其判定（相同 → 跳过；不同/判不了 → 顺延）
+                func uploadOrConverge() {
+                    if let second = dirList.first(where: { !$0.isDirectory && $0.name == candidate }) {
+                        self.verifyRemoteSameFile(id: id, clash: second, localSize: localSize,
+                                                  localHex: localHex, prefixLen: prefixLen) { same2 in
+                            self.stateQ.async {
+                                guard stillConnecting(id) else { return }
+                                if same2 == true {
+                                    self.skipUploadAsDuplicate(id, dir: dir, remotePath: second.path, needsMapping: needsMapping)
+                                } else {
+                                    self.beginUpload(id, dir: dir, remoteName: candidate, needsMapping: needsMapping,
+                                                     dirList: dirList, inflight: inflight, handle: handle)
+                                }
+                            }
+                        }
+                    } else {
+                        self.beginUpload(id, dir: dir, remoteName: candidate, needsMapping: needsMapping,
+                                         dirList: dirList, inflight: inflight, handle: handle)
+                    }
+                }
+
+                // 第一层：对同名 clash 判定
+                self.verifyRemoteSameFile(id: id, clash: clash, localSize: localSize,
+                                          localHex: localHex, prefixLen: prefixLen) { same in
+                    self.stateQ.async {
+                        guard stillConnecting(id) else { return }
+                        if same == true {
+                            self.skipUploadAsDuplicate(id, dir: dir, remotePath: clash.path, needsMapping: needsMapping)
+                        } else {
+                            uploadOrConverge()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 远端 clash 是否与本地内容相同：尺寸相等 → 拉 clash 前 prefixLen 字节比对（回调 hop 回 stateQ）。
+    /// completion: true=相同 / false=不同（尺寸不等或字节不符）/ nil=判定不了（读取失败、远端消失）
+    private func verifyRemoteSameFile(id: String, clash: FTPFileEntry, localSize: Int64,
+                                      localHex: String, prefixLen: Int64,
+                                      completion: @escaping (_ same: Bool?) -> Void) {
+        guard let remoteSize = clash.size, remoteSize == localSize else { completion(false); return }
+        guard let endpoint = endpointProvider() else { completion(nil); return }
+        engineProvider().downloadPrefix(endpoint, remotePath: clash.path, maxBytes: Int(prefixLen)) { [weak self] r in
+            guard let self = self else { return }
+            self.stateQ.async {
+                switch r {
+                case .success(let remoteData):
+                    completion((Int64(remoteData.count) == prefixLen && FileDigest.md5Hex(remoteData) == localHex) ? true : false)
+                case .failure:
+                    completion(nil)
+                }
+            }
+        }
+    }
+
+    /// 相同文件：不传输，直接标记完成并说明原因
+    private func skipUploadAsDuplicate(_ id: String, dir: String, remotePath: String, needsMapping: Bool) {
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        guard items[idx].phase == .connecting else { return }
         items[idx].remoteDir = dir
-        items[idx].remotePath = target.path
-        items[idx].needsNameMapping = target.needsMapping
+        items[idx].remotePath = remotePath
+        items[idx].needsNameMapping = needsMapping
+        items[idx].skippedReason = "电视上已有相同文件 · 已跳过"
+        items[idx] = QueueStateMachine.apply(.complete, to: items[idx])
+        persistLocked()
+        notifyChange()
+        scheduleIfNeeded() // 释放的槽位立刻派给后续排队项（与 applyEngineEvent 的完成路径一致）
+    }
+
+    /// 定名（净化名/指纹名 + 重名顺延）→ 起传
+    private func beginUpload(_ id: String, dir: String, remoteName: String, needsMapping: Bool,
+                             dirList: [FTPFileEntry], inflight: Set<String>, handle: TransferHandle) {
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        guard items[idx].phase == .connecting else { return } // 可能已被暂停/取消
+        let allNames = SmartRouting.existingNames(entries: dirList).union(inflight)
+        let unique = NameCodec.uniqued(remoteName, existing: allNames)
+        items[idx].remoteDir = dir
+        items[idx].remotePath = dir == "/" ? "/" + unique : dir + "/" + unique
+        items[idx].needsNameMapping = needsMapping
         startUpload(id, handle: handle)
     }
 

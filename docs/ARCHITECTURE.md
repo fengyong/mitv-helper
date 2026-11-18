@@ -70,7 +70,7 @@
 - `TransferProgress`（bytes/totalBytes/bytesPerSecond/fraction）、`TransferPhase`（UI 状态机）
 - `Capabilities`（8 个布尔探测位）、`EngineError`、`TransferHandle`（cancel()）
 - `NameCodec`（GBK 编码判断、emoji 替换、重名顺延）
-- `protocol TransferEngine`：ping/list/upload/download/delete/move/makeDirectory/size/probeCapabilities，**全部回调式**，回调统一主队列；progress ≥100ms 节流
+- `protocol TransferEngine`：ping/list/upload/download/**downloadPrefix**（2026-11-19 契约修订：读远端前 N 字节，重名判定用）/delete/move/makeDirectory/size/probeCapabilities，**全部回调式**，回调统一主队列；progress ≥100ms 节流
 - `protocol TransferEngineFactory`：注入用
 
 ## 5. Agent A · 传输引擎（Sources/MiTVEngine + Sources/mitvctl）
@@ -123,7 +123,7 @@ mitvctl mkdir  --host H --path P
 - `Services/HeartbeatService.swift`：10s NOOP，两连失败 → 掉线（黄条 + 队列暂停）→ 指数退避重连 5s/15s/30s…120s 封顶，重连成功恢复队列
 - `Services/PickService.swift`、`Services/StagingStore.swift`、`Services/TVFileService.swift`（浏览/删除/软删除/下载编排）
 - `Testing/MockEngine.swift` + `Testing/MockFactory.swift`：实现 TransferEngine 协议——可脚本化：list 返回预置目录树（含中文名文件）、upload 按 4MB/s 假进度走完全程、delete/move 落内存记账、probe 返回「GBK + APPE + 无 MKD + rename 可用」矩阵。**App 默认用 Mock（UserDefaults 键 `useMockEngine`，默认 true）**，主控集成时切真实引擎。
-- 智能分流（上传前定目标路径）：查远端列表（engine.list "/"）→ 视频→`/Movies/<GB名>`、图片→`/Pictures/<GB名>`、都没有→`/<GB名>`；卡片显示「将存到 …」；重名用 NameCodec.uniqued
+- 智能分流（上传前定目标路径）：查远端列表（engine.list "/"）→ 视频→`/Movies/<GB名>`、图片→`/Pictures/<GB名>`、都没有→`/<GB名>`；卡片显示「将存到 …」。命名策略（2026-11-19 定案）：原名尽可能保留，特殊字符替换 "-"；远端同名 → 比尺寸 + 前 10MB 指纹，相同文件跳过上传，不同文件改名 `原名-<md5前8>.ext`（判定不了保守改名，不覆盖）
 
 **AppKit 手法约束**（无 SwiftUI）：NSVisualEffectView 毛玻璃；自绘进度条（NSView draw + NSSetDisplaysWhenDrawing）；动画 NSAnimationContext；深浅色自适应跟系统；留白大方；**绝不出现 FTP/端口/主机等术语**。
 **DoD**：`make app` 编译通过 + `make test`（含 B 套件）全绿 + 启动后三态可切（Mock 下可见完整流程）+ 队列持久化重开恢复 + ServiceTests_B 覆盖（状态机/分流/软删除决策/持久化 round-trip）+ 至少 5 个小步 commit。

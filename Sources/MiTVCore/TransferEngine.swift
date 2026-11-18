@@ -38,6 +38,14 @@ public protocol TransferEngine: AnyObject {
                   onProgress: ((TransferProgress) -> Void)?,
                   completion: @escaping (Result<Int64, Error>) -> Void)
 
+    /// 读取远端文件前 maxBytes 字节（服务层上传重名的「相同文件」判定用）。
+    /// 读够即断开数据连接（不等到 EOF、不校验 226；服务器 426 由 QUIT 吸收）。
+    /// 文件短于 maxBytes 时返回实际读到的字节。契约修订 2026-11-19（主控）。
+    func downloadPrefix(_ endpoint: FTPEndpoint,
+                        remotePath: String,
+                        maxBytes: Int,
+                        completion: @escaping (Result<Data, Error>) -> Void)
+
     /// 删除远程文件（DELE）
     func delete(_ endpoint: FTPEndpoint, remotePath: String, completion: @escaping (Error?) -> Void)
 

@@ -15,6 +15,8 @@ final class MockEngine: TransferEngine {
         var size: Int64
         var children: [Node] = []
         weak var parent: Node?
+        /// 真实上传来源（downloadPrefix 读前缀字节做「相同文件」判定用；预置树节点为 nil）
+        var sourceLocalPath: String?
         init(name: String, isDirectory: Bool, size: Int64 = 0) {
             self.name = name
             self.isDirectory = isDirectory
@@ -150,7 +152,7 @@ final class MockEngine: TransferEngine {
                 switch result {
                 case .success:
                     self.lock.lock()
-                    self.placeFile(at: remotePath, size: total)
+                    self.placeFile(at: remotePath, size: total, source: localURL.path)
                     self.lock.unlock()
                     DispatchQueue.main.async { completion(.success(total)) }
                 case .failure(let e):
@@ -300,15 +302,46 @@ final class MockEngine: TransferEngine {
         return find(dir.isEmpty ? "/" : dir)
     }
 
-    private func placeFile(at path: String, size: Int64) {
+    private func placeFile(at path: String, size: Int64, source: String? = nil) {
         guard let parent = findParent(path) else { return }
         let name = (path as NSString).lastPathComponent
         if let existing = parent.children.first(where: { !$0.isDirectory && $0.name == name }) {
             existing.size = size
+            existing.sourceLocalPath = source ?? existing.sourceLocalPath
         } else {
             let n = Node(name: name, isDirectory: false, size: size)
+            n.sourceLocalPath = source
             n.parent = parent
             parent.children.append(n)
+        }
+    }
+
+    /// 读「远端」文件前 maxBytes 字节：真实上传的节点读其本地源文件（同文件判定在 Mock 下也成立）；
+    /// 预置树节点回退到确定性伪随机样例数据
+    func downloadPrefix(_ endpoint: FTPEndpoint, remotePath: String, maxBytes: Int,
+                        completion: @escaping (Result<Data, Error>) -> Void) {
+        after(latency) {
+            self.lock.lock()
+            let node = self.find(remotePath)
+            let isFile = node?.isDirectory == false
+            let size = node?.size ?? 0
+            let source = node?.sourceLocalPath
+            self.lock.unlock()
+            guard isFile else {
+                DispatchQueue.main.async { completion(.failure(EngineError.remoteNotFound(remotePath))) }
+                return
+            }
+            let want = Int(min(Int64(max(0, maxBytes)), size))
+            let data: Data?
+            if let src = source {
+                data = FileDigest.readPrefix(at: URL(fileURLWithPath: src), maxBytes: Int64(want))
+            } else {
+                data = MockEngine.sampleData(size: want, seed: abs(remotePath.hashValue))
+            }
+            DispatchQueue.main.async {
+                if let d = data { completion(.success(d)) }
+                else { completion(.failure(EngineError.ioError("本地文件不可读：\(source ?? remotePath)"))) }
+            }
         }
     }
 

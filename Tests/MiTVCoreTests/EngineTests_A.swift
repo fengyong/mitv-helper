@@ -206,6 +206,35 @@ enum EngineTests_A {
         assertEqual(lines, ["a", "bb", "ccc"], "CRLF+尾行切分")
         let lines2 = FTPControlConnection.splitLines(Array("x\ny\n".utf8), encoding: .utf8)
         assertEqual(lines2, ["x", "y"], "裸 LF 切分")
+
+        // MARK: 文件指纹（重名判定用：前 min(size,10MB) 字节 md5）
+
+        assertEqual(FileDigest.md5Hex(Data("abc".utf8)), "900150983cd24fb0d6963f7d28e17f72", "MD5 已知向量")
+        assertEqual(FileDigest.md5Hex(Data()), "d41d8cd98f00b204e9800998ecf8427e", "空数据 MD5")
+        let tmpDir = NSTemporaryDirectory()
+        let fp = URL(fileURLWithPath: tmpDir).appendingPathComponent("mitv-digest-\(UUID().uuidString).bin")
+        try! Data([0x41, 0x42, 0x43, 0x44]).write(to: fp) // "ABCD"
+        assertEqual(FileDigest.fingerprint(url: fp, fileSize: 4)?.hex, FileDigest.md5Hex(Data("ABCD".utf8)),
+                    "小文件指纹=全文件 md5")
+        assertEqual(FileDigest.fingerprint(url: fp, fileSize: 4)?.prefixLen, 4, "前缀长度=文件大小")
+        try! Data(repeating: 0x5A, count: 64).write(to: fp)
+        let half = FileDigest.fingerprint(url: fp, fileSize: 64)
+        assertEqual(half?.prefixLen, 64, "小文件前缀=全文件")
+        let over = FileDigest.fingerprint(url: fp, fileSize: FileDigest.prefixLimit * 2)
+        assertTrue(over == nil, "声称大小超过实际文件 → nil（IO 异常保护）")
+
+        // 大文件路径：真实 12MB 内容 → 指纹恰为前 10MB 的 md5
+        let big = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-digest-big-\(UUID().uuidString).bin")
+        try! Data(repeating: 0x5A, count: 12 * 1024 * 1024).write(to: big)
+        let bigFP = FileDigest.fingerprint(url: big, fileSize: 12 * 1024 * 1024)
+        assertEqual(bigFP?.prefixLen, FileDigest.prefixLimit, "大文件前缀=10MB 上限")
+        let bigHead = FileDigest.readPrefix(at: big, maxBytes: FileDigest.prefixLimit)
+        assertEqual(bigFP?.hex, bigHead.map { FileDigest.md5Hex($0) }, "大文件指纹=前 10MB 的 md5")
+        try? FileManager.default.removeItem(at: big)
+
+        let missing = FileDigest.fingerprint(url: URL(fileURLWithPath: "/nonexistent-\(UUID().uuidString)"), fileSize: 100)
+        assertTrue(missing == nil, "文件不存在 → nil")
+        try? FileManager.default.removeItem(at: fp)
     }
 
     /// EngineError 带关联值无法 ==，用模式匹配判定
