@@ -211,7 +211,7 @@ final class TVBrowserView: NSView {
         } else {
             trashChip.isHidden = true
         }
-        emptyLabel.isHidden = isTrashMode ? trashRecords.isEmpty : entries.isEmpty
+        emptyLabel.isHidden = isTrashMode ? !trashRecords.isEmpty : !entries.isEmpty
     }
 
     @objc private func goBack() {
@@ -344,6 +344,80 @@ final class TVBrowserView: NSView {
             if failed > 0 { self.coordinator.showToast("有 \(failed) 项还原失败") }
             self.enterTrash()
         }
+    }
+
+    // MARK: 冒烟辅助（仅供自动化验证交互路径）
+
+    func smokeSelectFirstFiles(_ n: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self = self else { return }
+            let filesOnly = self.entries.filter { !$0.isDirectory }
+            self.selected = Set(filesOnly.prefix(n).map { $0.path })
+            self.anchorIndex = 0
+            self.collection.reloadData()
+            self.updateActionBar()
+        }
+    }
+
+    func smokeConfirmSelected() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self = self, !self.selected.isEmpty else { return }
+            self.coordinator.confirmDelete(self.selectedEntries()) { [weak self] in
+                self?.clearSelection()
+                self?.reload()
+            }
+        }
+    }
+
+    /// 冒烟：选第一个文件 → 确认浮层 → 自动确认 → （配合 MITV_AUTO_UNDO 在下次启动撤销）
+    func smokeDeleteFirstFile() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self = self else { return }
+            let files = self.entries.filter { !$0.isDirectory }
+            guard let first = files.first else { return }
+            self.selected = [first.path]
+            self.anchorIndex = 0
+            self.collection.reloadData()
+            self.updateActionBar()
+            self.coordinator.confirmDelete([first]) { [weak self] in
+                self?.clearSelection()
+                self?.reload()
+            }
+            self.coordinator.confirmOverlay?.smokeAutoConfirm(after: 1.0)
+            // 同进程内自动撤销（Mock 树是进程内存态，跨进程无法还原）
+            if ProcessInfo.processInfo.environment["MITV_AUTO_UNDO_INPLACE"] == "1" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
+                    guard let self = self else { return }
+                    let records = self.coordinator.trashStore.records
+                    guard !records.isEmpty else { NSLog("MITV-SMOKE inplace-undo: no records"); return }
+                    self.coordinator.files.restore(records, progress: { _, _, _ in }) { restored, failed in
+                        NSLog("MITV-SMOKE inplace-undo restored=%d failed=%d", restored, failed)
+                        self.clearSelection()
+                        self.reload()
+                    }
+                }
+            }
+        }
+    }
+
+    /// 冒烟：把 trash.json 里的记录全部还原（验证撤销链路）
+    func smokeUndoAll() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self = self else { return }
+            let records = self.coordinator.trashStore.records
+            guard !records.isEmpty else {
+                NSLog("MITV-SMOKE undo: no records")
+                return
+            }
+            self.files.restore(records, progress: { _, _, _ in }) { restored, failed in
+                NSLog("MITV-SMOKE undo restored=%d failed=%d", restored, failed)
+                self.enterTrashRefreshIfInTrash()
+            }
+        }
+    }
+
+    private func enterTrashRefreshIfInTrash() {
+        if isTrashMode { enterTrash() }
     }
 
     // MARK: 键盘（⌘A / Esc / ⌫）

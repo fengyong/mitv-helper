@@ -76,7 +76,7 @@ final class LocalThumbnailLoader {
         switch kind {
         case .video: return Icons.film
         case .image: return Icons.photo
-        case .other: return Icons.folder
+        case .other: return Icons.doc
         }
     }
 }

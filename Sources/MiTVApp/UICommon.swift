@@ -109,6 +109,22 @@ enum Icons {
         }
     }
 
+    /// 文档（.txt 等其他文件的兜底图标）
+    static let doc: NSImage = make(18) { s in
+        let r = NSRect(x: 4, y: 2.5, width: s - 8, height: s - 5).insetBy(dx: 0.5, dy: 0.5)
+        let p = NSBezierPath(roundedRect: r, xRadius: 2, yRadius: 2)
+        p.lineWidth = 1.3
+        p.stroke()
+        for i in 1...3 {
+            let y = r.minY + r.height * CGFloat(i) / 4.0
+            let line = NSBezierPath()
+            line.move(to: NSPoint(x: r.minX + 2.5, y: y))
+            line.line(to: NSPoint(x: r.maxX - 2.5, y: y))
+            line.lineWidth = 1.0
+            line.stroke()
+        }
+    }
+
     static let trash: NSImage = make(18) { s in
         let lid = NSBezierPath()
         lid.move(to: NSPoint(x: 3.5, y: 13.5)); lid.line(to: NSPoint(x: 14.5, y: 13.5))
@@ -440,6 +456,10 @@ final class ToastHostView: NSView {
     }
 
     func show(_ toast: ToastView, in bounds: NSRect) {
+        // 单条 toast：新 toast 顶掉旧的，避免叠影
+        for sub in subviews {
+            sub.removeFromSuperview()
+        }
         let ideal = toast.fittingSize
         toast.frame = NSRect(x: bounds.midX - ideal.width / 2,
                              y: bounds.maxY - ideal.height - 18,

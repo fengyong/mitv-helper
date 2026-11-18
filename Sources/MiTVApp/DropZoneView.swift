@@ -31,19 +31,17 @@ final class EmptyStateView: NSView {
 
         bigIcon.image = Icons.dropBig
         bigIcon.contentTintColor = NSColor.controlAccentColor.withAlphaComponent(0.75)
-        bigIcon.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(bigIcon)
 
-        for v in [titleLabel, subLabel, photoButton, fileButton, hintLabel] {
-            v.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(v)
-        }
+        let centerStack = NSStackView(views: [bigIcon, titleLabel, subLabel, photoButton, fileButton])
+        centerStack.orientation = .vertical
+        centerStack.spacing = 14
+        centerStack.setCustomSpacing(22, after: subLabel)
+        centerStack.alignment = .centerX
+        centerStack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(centerStack)
 
-        let photoFileStack = NSStackView(views: [photoButton, fileButton])
-        photoFileStack.orientation = .horizontal
-        photoFileStack.spacing = 12
-        photoFileStack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(photoFileStack)
+        hintLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(hintLabel)
 
         NSLayoutConstraint.activate([
             effect.topAnchor.constraint(equalTo: topAnchor),
@@ -56,17 +54,10 @@ final class EmptyStateView: NSView {
             dashedBox.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 26),
             dashedBox.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -26),
 
-            bigIcon.centerXAnchor.constraint(equalTo: centerXAnchor),
-            bigIcon.bottomAnchor.constraint(equalTo: titleLabel.topAnchor, constant: -18),
-            bigIcon.widthAnchor.constraint(equalToConstant: 96),
-            bigIcon.heightAnchor.constraint(equalToConstant: 96),
-
-            titleLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            subLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            subLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
-
-            photoFileStack.centerXAnchor.constraint(equalTo: centerXAnchor),
-            photoFileStack.topAnchor.constraint(equalTo: subLabel.bottomAnchor, constant: 22),
+            centerStack.centerXAnchor.constraint(equalTo: centerXAnchor),
+            centerStack.centerYAnchor.constraint(equalTo: dashedBox.centerYAnchor, constant: -8),
+            centerStack.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 60),
+            centerStack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -60),
 
             hintLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
             hintLabel.bottomAnchor.constraint(equalTo: dashedBox.bottomAnchor, constant: -16),

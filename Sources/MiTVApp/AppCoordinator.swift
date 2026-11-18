@@ -53,7 +53,7 @@ final class AppCoordinator: NSObject {
     private var yellowBannerUp = false
     private var photoPicker: PhotoPickerController?
     private var onboarding: OnboardingOverlay?
-    private var confirmOverlay: ConfirmOverlay?
+    var confirmOverlay: ConfirmOverlay? // 冒烟自动化需要访问；正常流程不受影响
     private var settingsController: SettingsController?
 
     // MARK: - Init
@@ -151,6 +151,82 @@ final class AppCoordinator: NSObject {
         if queue.snapshot().isEmpty == false {
             showState(queueView)
             queueView.reload()
+        }
+        runSmokeHooksIfNeeded()
+    }
+
+    /// 退出前：停调度 + 强制原子写队列（重启后断点续传）
+    func prepareForTermination() {
+        heartbeat.stop()
+        queue.suspendForShutdown()
+    }
+
+    // MARK: - 冒烟辅助（GUI 自动化受限时用环境变量驱动；不影响正常使用）
+
+    private func runSmokeHooksIfNeeded() {
+        let env = ProcessInfo.processInfo.environment
+        // 快照钩子独立于其他钩子（仅冒烟验证用，不影响正常使用）
+        if let snapPath = env["MITV_SNAPSHOT"] {
+            let delay = Double(env["MITV_SNAPSHOT_DELAY"] ?? "3.0") ?? 3.0
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.writeSnapshot(to: snapPath)
+                self?.prepareForTermination()
+                exit(0)
+            }
+        }
+        if let files = env["MITV_AUTO_ENQUEUE"], !files.isEmpty {
+            let urls = files.split(separator: ",").map { URL(fileURLWithPath: String($0)) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.enqueueFileURLs(urls)
+            }
+        }
+        if env["MITV_AUTO_DROP"] == "1" {
+            (EngineHolder.shared.engine() as? MockEngine)?.failNextPingCount = 3
+        }
+        guard let auto = env["MITV_AUTO"] else { return }
+        if auto == "browser" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.setMode(.browser)
+                if let sel = env["MITV_AUTO_SEL"], let n = Int(sel), n > 0 {
+                    self?.browserView.smokeSelectFirstFiles(n)
+                }
+                if env["MITV_AUTO_CONFIRM"] == "1" {
+                    self?.browserView.smokeConfirmSelected()
+                }
+            }
+        }
+        if auto == "browser" {
+            if env["MITV_AUTO_DELETE"] == "1" {
+                self.browserView.smokeDeleteFirstFile()
+            }
+            if env["MITV_AUTO_UNDO"] == "1" {
+                self.browserView.smokeUndoAll()
+            }
+        }
+        if auto == "queue" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.setMode(.home)
+            }
+        }
+    }
+
+    /// 离屏渲染窗口内容为 PNG（不依赖屏幕录制权限）
+    private func writeSnapshot(to path: String) {
+        guard let content = window.contentView else { return }
+        let scale: CGFloat = 2
+        let size = content.bounds.size
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                         pixelsWide: Int(size.width * scale),
+                                         pixelsHigh: Int(size.height * scale),
+                                         bitsPerSample: 8, samplesPerPixel: 4,
+                                         hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0) else { return }
+        rep.size = size
+        content.cacheDisplay(in: content.bounds, to: rep)
+        if let png = rep.representation(using: .png, properties: [:]) {
+            try? png.write(to: URL(fileURLWithPath: path))
+            NSLog("MITV-SNAPSHOT written: %@", path)
         }
     }
 

@@ -145,7 +145,7 @@ final class QueueView: NSView {
         if !busy.isEmpty {
             let left = busy.reduce(Int64(0)) { $0 + max(0, $1.sizeBytes - $1.bytes) }
             var text = "正在发送 \(busy.count) 项"
-            if speed > 0 { text += " · \(Fmt.speed(speed))" }
+            if let spd = Fmt.speed(speed), speed > 0 { text += " · \(spd)" }
             if let eta = Fmt.eta(left, bps: speed) { text += " · \(eta)" }
             summaryLabel.stringValue = text
         } else if active.contains(where: { $0.isBusy }) {
@@ -168,7 +168,7 @@ final class QueueView: NSView {
             views.append(card)
         }
         // 回收不再展示的卡片
-        for (id, card) in cards where !usedIds.contains(id) && !groupExpanded {
+        for (id, card) in cards where !usedIds.contains(id) {
             card.removeFromSuperview()
             cards.removeValue(forKey: id)
         }
@@ -180,6 +180,7 @@ final class QueueView: NSView {
             var text = "已完成 \(done) 项"
             if canceled > 0 { text += " · 已取消 \(canceled) 项" }
             groupHeader.configure(text: text, expanded: groupExpanded)
+            views.append(groupHeader) // 折叠组标题插在活动卡片与历史卡片之间
             if groupExpanded {
                 for item in grouped {
                     let card = cards[item.id] ?? {

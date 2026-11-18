@@ -286,4 +286,11 @@ final class ConfirmOverlay: NSView {
             self?.removeFromSuperview()
         })
     }
+
+    /// 冒烟辅助：自动点确认按钮
+    func smokeAutoConfirm(after delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.confirmButton.tapAction?()
+        }
+    }
 }
