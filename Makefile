@@ -35,12 +35,13 @@ build/MiTVApp: $(CORE) $(ENGINE) $(APP)
 	  -framework AppKit -framework AVFoundation -framework Photos -framework Network -o $@
 
 # 测试（轻量自研 runner，不用 XCTest；失败非零退出）
+# 注：测试目标需编译 $(ENGINE)——EngineTests_A 引擎单测引用 MiTVEngine 源码（单模块合并编译）
 test: build/test-runner
 	./build/test-runner
 
-build/test-runner: $(CORE) $(TESTS)
+build/test-runner: $(CORE) $(ENGINE) $(TESTS)
 	@mkdir -p build
-	$(SWIFT) $(FLAGS) -module-name MiTVTests $(CORE) $(TESTS) -framework Foundation -o $@
+	$(SWIFT) $(FLAGS) -module-name MiTVTests $(CORE) $(ENGINE) $(TESTS) -framework Foundation -o $@
 
 # 快速类型检查（不产出二进制，CI 心跳用）
 typecheck:

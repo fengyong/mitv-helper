@@ -32,8 +32,9 @@ enum FTPListParser {
         }
 
         let first = trimmed.first ?? "-"
-        guard "-dlbcpsDL".contains(first) else {
-            // 无类型位（NLIST / 部分嵌入式服务器的裸文件名行）
+        // 单 token 行 / 首字符非类型位 → 裸文件名行（NLIST、部分嵌入式服务器；整行作名字，空格保留）
+        let looksLikeUnixPerms = tokens.count >= 2 && "-dlbcpsDL".contains(first)
+        if !looksLikeUnixPerms {
             var name = trimmed
             var isDir = false
             if name.hasSuffix("/") { name = String(name.dropLast()); isDir = true }
@@ -41,7 +42,6 @@ enum FTPListParser {
             return makeEntry(name: name, isDirectory: isDir, size: nil, modified: nil, parentPath: parentPath)
         }
 
-        guard tokens.count >= 2 else { return nil }
         let dateStart = findDateStart(tokens)
 
         // size = 日期块之前最后一个纯数字 token（links/owner/group 一般非数字；即便为数字，逆序取最后一个即 size）
@@ -52,7 +52,7 @@ enum FTPListParser {
             }
         }
 
-        // 名字起点：日期块之后跳过「时间/年份」token
+        // 名字起点：日期块之后跳过「时间/年份」token；无日期行兜底为最后一个 token
         var nameStart: Int
         if let ds = dateStart {
             nameStart = tokens[ds].contains("-") ? ds + 2 : ds + 3 // ISO 日期 2 段；unix 传统「月 日 时间」3 段
@@ -60,11 +60,21 @@ enum FTPListParser {
                 nameStart -= 1 // 服务器省略时间字段时回退
             }
         } else {
-            nameStart = tokens.count - 1 // 无日期行兜底：最后一个 token 是名字
+            nameStart = tokens.count - 1
+            if tokens.count > 2 {
+                for i in (1..<tokens.count - 1).reversed() {
+                    if let v = Int64(tokens[i]) { size = v; break }
+                }
+            }
         }
         guard nameStart < tokens.count else { return nil }
-        let nameRaw = substringFromToken(trimmed, tokenIndex: nameStart)
-            ?? tokens[nameStart...].joined(separator: " ")
+        let nameRaw: String
+        if dateStart != nil {
+            nameRaw = substringFromToken(trimmed, tokenIndex: nameStart)
+                ?? tokens[nameStart...].joined(separator: " ")
+        } else {
+            nameRaw = tokens[nameStart...].joined(separator: " ")
+        }
 
         var name = nameRaw
         var isDir = (first == "d")
