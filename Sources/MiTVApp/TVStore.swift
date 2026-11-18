@@ -16,6 +16,10 @@ struct TVPersistState: Codable, Equatable {
 final class TVStore {
 
     static func defaultDirectory() -> URL {
+        // 冒烟隔离：设置 MITV_DATA_DIR 时所有持久化（tv/queue/trash/Staging）都落到该目录
+        if let custom = ProcessInfo.processInfo.environment["MITV_DATA_DIR"], !custom.isEmpty {
+            return URL(fileURLWithPath: custom, isDirectory: true)
+        }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return base.appendingPathComponent("MiTVHelper", isDirectory: true)

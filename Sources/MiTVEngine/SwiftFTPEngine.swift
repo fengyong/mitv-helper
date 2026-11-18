@@ -197,51 +197,62 @@ public final class SwiftFTPEngine: TransferEngine {
             defer { fh.closeFile() }
             fh.truncateFile(atOffset: 0) // 覆盖式下载
 
-            return try self.withConnection(endpoint) { conn in
-                let rs: Int64? = (try? conn.remoteSize(remote)) ?? nil
-                let total: Int64 = rs ?? -1 // SIZE 拿不到 → 未知
+            do {
+                let bytes = try self.withConnection(endpoint) { conn -> Int64 in
+                    let rs: Int64? = (try? conn.remoteSize(remote)) ?? nil
+                    let total: Int64 = rs ?? -1 // SIZE 拿不到 → 未知
 
-                var received: Int64 = 0
-                let throttler = FTPProgressThrottler(minInterval: 0.1)
-                var lastSampleTime = CFAbsoluteTimeGetCurrent()
-                var lastSampleBytes: Int64 = 0
-                var speed: Double = 0
+                    var received: Int64 = 0
+                    let throttler = FTPProgressThrottler(minInterval: 0.1)
+                    var lastSampleTime = CFAbsoluteTimeGetCurrent()
+                    var lastSampleBytes: Int64 = 0
+                    var speed: Double = 0
 
-                func emit(force: Bool) {
-                    let now = CFAbsoluteTimeGetCurrent()
-                    guard force || throttler.shouldEmit(now: now) else { return }
-                    let dt = now - lastSampleTime
-                    if dt > 0.05 {
-                        let inst = Double(received - lastSampleBytes) / dt
-                        speed = speed <= 0 ? inst : speed * 0.6 + inst * 0.4
-                        lastSampleTime = now
-                        lastSampleBytes = received
+                    func emit(force: Bool) {
+                        let now = CFAbsoluteTimeGetCurrent()
+                        guard force || throttler.shouldEmit(now: now) else { return }
+                        let dt = now - lastSampleTime
+                        if dt > 0.05 {
+                            let inst = Double(received - lastSampleBytes) / dt
+                            speed = speed <= 0 ? inst : speed * 0.6 + inst * 0.4
+                            lastSampleTime = now
+                            lastSampleBytes = received
+                        }
+                        if let cb = onProgress {
+                            let p = TransferProgress(bytes: received, totalBytes: total, bytesPerSecond: speed)
+                            DispatchQueue.main.async { cb(p) }
+                        }
                     }
-                    if let cb = onProgress {
-                        let p = TransferProgress(bytes: received, totalBytes: total, bytesPerSecond: speed)
-                        DispatchQueue.main.async { cb(p) }
+
+                    let data = try conn.beginTransfer(cmd: "RETR", path: remote)
+                    do {
+                        var buf = [UInt8](repeating: 0, count: SwiftFTPEngine.chunkSize)
+                        while true {
+                            if let h = handle, h.isCanceled { throw EngineError.aborted }
+                            let n = try data.read(&buf, maxCount: buf.count)
+                            if n == 0 { break } // 服务器 EOF = 数据收完
+                            fh.write(Data(buf[0..<n]))
+                            received += Int64(n)
+                            emit(force: false)
+                        }
+                        data.closeNow()
+                        // 完整性校验：SIZE 已知时字节数必须吻合——防服务器提前断流把半截文件当成功
+                        if total >= 0, received != total {
+                            throw EngineError.ioError("下载不完整：应收 \(total) 字节，实收 \(received) 字节")
+                        }
+                        try conn.finishTransfer()
+                        emit(force: true)
+                        return received
+                    } catch {
+                        data.closeNow()
+                        throw error
                     }
                 }
-
-                let data = try conn.beginTransfer(cmd: "RETR", path: remote)
-                do {
-                    var buf = [UInt8](repeating: 0, count: SwiftFTPEngine.chunkSize)
-                    while true {
-                        if let h = handle, h.isCanceled { throw EngineError.aborted }
-                        let n = try data.read(&buf, maxCount: buf.count)
-                        if n == 0 { break } // 服务器 EOF = 数据收完
-                        fh.write(Data(buf[0..<n]))
-                        received += Int64(n)
-                        emit(force: false)
-                    }
-                    data.closeNow()
-                    try conn.finishTransfer()
-                    emit(force: true)
-                    return received
-                } catch {
-                    data.closeNow()
-                    throw error
-                }
+                return bytes
+            } catch {
+                // 失败/取消：清掉半截本地文件（重试会重新创建）
+                try? fm.removeItem(at: localURL)
+                throw error
             }
         }, completion: completion)
     }

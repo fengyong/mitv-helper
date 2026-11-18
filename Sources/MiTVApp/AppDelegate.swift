@@ -28,8 +28,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: 菜单（最小集，快捷键齐全）
+    // 必须是实例方法：菜单项 target 指向 self（实例）。写成 static 时 target 会变成类对象，
+    // 实例方法 selector 不被响应 → 菜单项被禁用（⇧⌘P / ⇧⌘O 失效）。
 
-    static func buildMainMenu() -> NSMenu {
+    func buildMainMenu() -> NSMenu {
         let main = NSMenu()
 
         let appItem = NSMenuItem()

@@ -185,7 +185,9 @@ final class MockEngine: TransferEngine {
                 DispatchQueue.main.async { completion(.failure(EngineError.ioError(error.localizedDescription))) }
                 return
             }
-            onProgress?(TransferProgress(bytes: size, totalBytes: size, bytesPerSecond: 0))
+            DispatchQueue.main.async {
+                onProgress?(TransferProgress(bytes: size, totalBytes: size, bytesPerSecond: 0))
+            }
             DispatchQueue.main.async { completion(.success(size)) }
         }
     }

@@ -19,6 +19,9 @@ PASS=0
 FAIL=0
 SERVER_PID=""
 
+# 工作目录先行创建（pip 日志等在此之前就有重定向写入）
+mkdir -p "$WORK"
+
 ok()  { PASS=$((PASS+1)); echo "  ✅ $1"; }
 ng()  { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
 # check <说明> <命令...>

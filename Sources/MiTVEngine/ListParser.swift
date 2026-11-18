@@ -52,12 +52,15 @@ enum FTPListParser {
             }
         }
 
-        // 名字起点：日期块之后跳过「时间/年份」token；无日期行兜底为最后一个 token
+        // 名字起点：日期块之后是「时间/年份」token（可能缺失，如 "Nov 18 file.mp4"），名字紧随其后；
+        // 无日期行兜底为最后一个 token
         var nameStart: Int
         if let ds = dateStart {
-            nameStart = tokens[ds].contains("-") ? ds + 2 : ds + 3 // ISO 日期 2 段；unix 传统「月 日 时间」3 段
-            while nameStart - 1 > ds, nameStart < tokens.count, !looksLikeTimeOrYear(tokens[nameStart - 1]) {
-                nameStart -= 1 // 服务器省略时间字段时回退
+            let timeSlot = tokens[ds].contains("-") ? ds + 1 : ds + 2 // ISO 日期后一段；unix 传统月名的「日」后一段
+            if timeSlot < tokens.count, looksLikeTimeOrYear(tokens[timeSlot]) {
+                nameStart = timeSlot + 1
+            } else {
+                nameStart = timeSlot // 时间字段缺失：名字紧跟日期
             }
         } else {
             nameStart = tokens.count - 1
@@ -165,6 +168,9 @@ enum FTPListParser {
             var year = cal.component(.year, from: now)
             var recent = false
             let last = tokens[ds + 2]
+            if !last.contains(":"), Int(last) == nil {
+                return nil // 无时间/年份字段（名字紧跟日期），日期信息不完整
+            }
             if last.contains(":") {
                 let parts = last.split(separator: ":")
                 comps.hour = Int(parts.first ?? "0") ?? 0

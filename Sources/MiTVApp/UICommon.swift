@@ -289,7 +289,7 @@ final class CapsuleButton: NSButton {
         self.action = #selector(didTap)
         font = NSFont.systemFont(ofSize: 13, weight: .medium)
         contentTintColor = nil
-        let ta = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .inVisibleRect, .activeInKeyWindow], owner: nil, userInfo: nil)
+        let ta = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .inVisibleRect, .activeInKeyWindow], owner: self, userInfo: nil)
         addTrackingArea(ta)
     }
 

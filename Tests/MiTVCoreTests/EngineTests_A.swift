@@ -80,6 +80,26 @@ enum EngineTests_A {
         assertEqual(odd[0].size ?? -1, 42, "无日期行 size 逆序提取")
         assertEqual(odd[1].name, "bare-name.mkv", "裸文件名行")
 
+        // 无时间字段（部分嵌入式服务器省略时间/年份）——不得整行丢弃
+        let noTime = FTPListParser.parse([
+            "-rw-r--r-- 1 u g 42 Nov 18 file.mp4",
+            "-rw-r--r-- 1 u g 42 2020-01-01 iso.mp4",
+            "drwxr-xr-x 2 u g 4096 Nov 18 2020 年份目录",
+        ], parentPath: "/")
+        assertEqual(noTime.count, 3, "无时间字段三行全部解析")
+        assertEqual(noTime[0].name, "file.mp4", "月名+日 无时间字段取名字")
+        assertEqual(noTime[0].size ?? -1, 42, "月名+日 无时间字段 size")
+        assertTrue(noTime[0].modified == nil, "无时间字段 modified 为空（不误读名字当时间）")
+        assertEqual(noTime[1].name, "iso.mp4", "ISO 日期无时间字段")
+        assertEqual(noTime[2].name, "年份目录", "月名+年份仍正确")
+
+        // 文件名本身以「时间样式」开头——不得被时间字段跳过误吞
+        let timeName = FTPListParser.parse([
+            "-rw-r--r-- 1 u g 999 Nov 18 10:30 10:30 backup.mp4",
+        ], parentPath: "/")
+        assertEqual(timeName.count, 1, "时间样式开头文件名仍解析")
+        assertEqual(timeName.first?.name, "10:30 backup.mp4", "名字内时间样式保留")
+
         // Windows 风格
         let win = FTPListParser.parse([
             "11-18-26  10:30AM  <DIR>  Movies",

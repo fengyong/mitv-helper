@@ -55,6 +55,8 @@ final class AppCoordinator: NSObject {
     private var onboarding: OnboardingOverlay?
     var confirmOverlay: ConfirmOverlay? // 冒烟自动化需要访问；正常流程不受影响
     private var settingsController: SettingsController?
+    /// 「删除前先下载」的批次登记：batchId → (待删文件, 完成回调)。整批取回成功后才执行删除
+    private var pendingDeleteBatches: [String: (files: [FTPFileEntry], after: () -> Void)] = [:]
 
     // MARK: - Init
 
@@ -136,7 +138,9 @@ final class AppCoordinator: NSObject {
         ])
 
         queue.onChanged = { [weak self] in self?.handleQueueChanged() }
-        queue.onBatchCompleted = { [weak self] _, ok, bad in self?.handleBatchCompleted(ok: ok, bad: bad) }
+        queue.onBatchCompleted = { [weak self] batchId, ok, bad in
+            self?.handleBatchCompleted(batchId: batchId, ok: ok, bad: bad)
+        }
         heartbeat.onStatus = { [weak self] status in self?.handleHeartbeat(status) }
 
         showState(emptyView)
@@ -186,6 +190,11 @@ final class AppCoordinator: NSObject {
             (EngineHolder.shared.engine() as? MockEngine)?.failNextPingCount = 3
         }
         guard let auto = env["MITV_AUTO"] else { return }
+        if auto == "settings" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.openSettings()
+            }
+        }
         if auto == "browser" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 self?.setMode(.browser)
@@ -194,6 +203,9 @@ final class AppCoordinator: NSObject {
                 }
                 if env["MITV_AUTO_CONFIRM"] == "1" {
                     self?.browserView.smokeConfirmSelected()
+                }
+                if env["MITV_AUTO_ENTER"] == "1" {
+                    self?.browserView.smokeEnterFirstDirectory()
                 }
             }
         }
@@ -212,24 +224,33 @@ final class AppCoordinator: NSObject {
         }
     }
 
-    /// 离屏渲染窗口内容为 PNG（不依赖屏幕录制权限）
+    /// 离屏渲染窗口内容为 PNG（不依赖屏幕录制权限）；主窗口有 sheet 时一并渲染（sheet 是独立窗口）
     private func writeSnapshot(to path: String) {
-        guard let content = window.contentView else { return }
+        if let content = window.contentView, let png = Self.renderPNG(view: content) {
+            try? png.write(to: URL(fileURLWithPath: path))
+            NSLog("MITV-SNAPSHOT written: %@", path)
+        }
+        for w in NSApp.windows where w.sheetParent === window {
+            guard let content = w.contentView, let png = Self.renderPNG(view: content) else { continue }
+            let sheetPath = path + ".sheet.png"
+            try? png.write(to: URL(fileURLWithPath: sheetPath))
+            NSLog("MITV-SNAPSHOT sheet written: %@", sheetPath)
+        }
+    }
+
+    private static func renderPNG(view: NSView) -> Data? {
         let scale: CGFloat = 2
-        let size = content.bounds.size
+        let size = view.bounds.size
         guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
                                          pixelsWide: Int(size.width * scale),
                                          pixelsHigh: Int(size.height * scale),
                                          bitsPerSample: 8, samplesPerPixel: 4,
                                          hasAlpha: true, isPlanar: false,
                                          colorSpaceName: .deviceRGB,
-                                         bytesPerRow: 0, bitsPerPixel: 0) else { return }
+                                         bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
         rep.size = size
-        content.cacheDisplay(in: content.bounds, to: rep)
-        if let png = rep.representation(using: .png, properties: [:]) {
-            try? png.write(to: URL(fileURLWithPath: path))
-            NSLog("MITV-SNAPSHOT written: %@", path)
-        }
+        view.cacheDisplay(in: view.bounds, to: rep)
+        return rep.representation(using: .png, properties: [:])
     }
 
     func showWindow() {
@@ -263,6 +284,14 @@ final class AppCoordinator: NSObject {
             showOnboarding()
         } else if case .lost = heartbeatStatus {
             heartbeat.checkNow()
+        } else if heartbeatStatus == .off, let ep = store.endpoint {
+            // 启动探测失败等场景（心跳未运行）：手动重连一次
+            header.capsule.setLook(.connecting, "正在连接电视…")
+            connect(endpoint: ep) { [weak self] ok, error in
+                if !ok {
+                    self?.showToast("还是连不上：\(error ?? "请确认电视上的「远程管理」还开着")")
+                }
+            }
         }
     }
 
@@ -424,20 +453,32 @@ final class AppCoordinator: NSObject {
         setMode(.home)
     }
 
-    private func handleBatchCompleted(ok: Int, bad: Int) {
+    private func handleBatchCompleted(batchId: String, ok: Int, bad: Int) {
+        // 「删除前先下载」的批次：整批取回成功才执行删除，失败则中止（数据安全兜底）
+        if let pending = pendingDeleteBatches.removeValue(forKey: batchId) {
+            if bad == 0 {
+                deleteRemote(pending.files, after: pending.after)
+            } else {
+                showToast("取回没有全部成功，已取消删除 · 可重试取回后再删")
+                pending.after()
+            }
+            return
+        }
+        let isDownload = queue.snapshot().first { $0.batchId == batchId }?.direction == .download
         if ok > 0 {
-            showToast("已把 \(ok) 个文件送到电视")
+            showToast(isDownload ? "已把 \(ok) 个文件取回到本地" : "已把 \(ok) 个文件送到电视")
             if UserDefaults.standard.bool(forKey: "soundOnComplete") {
                 NSSound(named: NSSound.Name("Glass"))?.play()
             }
             if UserDefaults.standard.bool(forKey: "notifyOnComplete") {
-                postSystemNotification(title: "发送完成", body: "\(ok) 个文件已送到电视")
+                let body = isDownload ? "\(ok) 个文件已保存到本地" : "\(ok) 个文件已送到电视"
+                postSystemNotification(title: isDownload ? "取回完成" : "发送完成", body: body)
             }
             NSApp.requestUserAttention(.informationalRequest)
             bounceWindow()
         }
         if bad > 0 {
-            showToast("有 \(bad) 个文件发送失败，可在列表里重试")
+            showToast(isDownload ? "有 \(bad) 个文件取回失败，可在列表里重试" : "有 \(bad) 个文件发送失败，可在列表里重试")
         }
     }
 
@@ -531,11 +572,14 @@ final class AppCoordinator: NSObject {
         guard !filesToDelete.isEmpty else { after(); return }
 
         if downloadFirst {
-            // 降级兜底：删除前先取回本地
+            // 降级兜底：先把文件全部取回本地，整批取回成功后才真正删除（失败则中止，不再先删后赌）
             picks.chooseFolder(on: window) { [weak self] dir in
                 guard let self = self, let dir = dir else { after(); return }
-                self.queue.addDownloads(filesToDelete, toDirectory: dir)
-                self.deleteRemote(filesToDelete, after: after)
+                let items = self.queue.addDownloads(filesToDelete, toDirectory: dir)
+                guard let batchId = items.first?.batchId else { after(); return }
+                self.pendingDeleteBatches[batchId] = (filesToDelete, after)
+                self.setMode(.home)
+                self.showToast("先把 \(items.count) 项取回本地 · 全部成功后才会删除")
             }
             return
         }
@@ -548,18 +592,26 @@ final class AppCoordinator: NSObject {
         files.deleteEntries(filesToDelete, progress: { _, _, _ in }) { [weak self] result in
             guard let self = self else { return }
             switch result {
-            case .success(let records):
-                if records.isEmpty {
-                    self.showToast("已永久删除 \(total) 项")
-                } else {
-                    let ids = records.map { $0.id }
-                    self.showToast("已删除 \(records.count) 项 · 随时可撤销", undo: { [weak self] in
-                        self?.files.restore(records.filter { ids.contains($0.id) },
+            case .success(let outcome):
+                if !outcome.records.isEmpty {
+                    // 软删除：可撤销（部分失败也如实说明）
+                    var text = "已删除 \(outcome.records.count) 项 · 随时可撤销"
+                    if !outcome.failedNames.isEmpty {
+                        text = "已删除 \(outcome.records.count) 项 · \(outcome.failedNames.count) 项没有成功 · 可撤销"
+                    }
+                    self.showToast(text, undo: { [weak self] in
+                        self?.files.restore(outcome.records,
                                             progress: { _, _, _ in }) { restored, failed in
                             if restored > 0 { self?.showToast("已还原 \(restored) 项") }
                             if failed > 0 { self?.showToast("有 \(failed) 项还原失败") }
                         }
                     })
+                } else if outcome.failedNames.isEmpty {
+                    self.showToast("已永久删除 \(total) 项")
+                } else if outcome.failedNames.count < total {
+                    self.showToast("已永久删除 \(total - outcome.failedNames.count) 项 · \(outcome.failedNames.count) 项没有成功")
+                } else {
+                    self.showToast("删除没有完成：\(outcome.failedNames.joined(separator: "、"))")
                 }
             case .failure(let error):
                 self.showToast("删除没有完成：\(error.localizedDescription)")

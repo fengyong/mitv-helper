@@ -20,6 +20,8 @@ final class TVBrowserView: NSView {
     // 视图
     private let backButton: NSButton
     private let breadcrumb = UIUtil.label("电视", size: 13, weight: .semibold)
+    /// 返回按钮显隐时同步更新（约束常量不能在 init 一次性求值）
+    private var breadcrumbLeading: NSLayoutConstraint!
     private let trashChip: CapsuleButton
     private let spinner = NSProgressIndicator()
     private let emptyLabel = UIUtil.label("这个文件夹是空的", size: 14, color: .secondaryLabelColor, align: .center)
@@ -58,6 +60,7 @@ final class TVBrowserView: NSView {
 
         breadcrumb.translatesAutoresizingMaskIntoConstraints = false
         addSubview(breadcrumb)
+        breadcrumbLeading = breadcrumb.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16)
 
         trashChip.tapAction = { [weak self] in self?.enterTrash() }
         trashChip.translatesAutoresizingMaskIntoConstraints = false
@@ -113,7 +116,7 @@ final class TVBrowserView: NSView {
             backButton.widthAnchor.constraint(equalToConstant: 24),
             backButton.heightAnchor.constraint(equalToConstant: 24),
 
-            breadcrumb.leadingAnchor.constraint(equalTo: leadingAnchor, constant: backButton.isHidden ? 16 : 46),
+            breadcrumbLeading,
             breadcrumb.topAnchor.constraint(equalTo: topAnchor, constant: 14),
 
             trashChip.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
@@ -188,7 +191,8 @@ final class TVBrowserView: NSView {
     }
 
     private func refreshChrome() {
-        // 面包屑（零术语：只显示目录名）
+        // 面包屑（零术语：只显示目录名）。注意顺序：先更新 backButton 显隐，再按新状态让位，
+        // 否则约束读到的是旧值（等于把「一次性求值」bug 换了个地方重演）
         if isTrashMode {
             breadcrumb.stringValue = "电视 / 回收站"
             backButton.isHidden = false
@@ -199,6 +203,7 @@ final class TVBrowserView: NSView {
             breadcrumb.stringValue = text
             backButton.isHidden = path == "/"
         }
+        breadcrumbLeading.constant = backButton.isHidden ? 16 : 46
         // 回收站入口（根目录且本地有记账）
         if !isTrashMode {
             let n = coordinator.trashStore.count
@@ -358,6 +363,14 @@ final class TVBrowserView: NSView {
 
     // MARK: 冒烟辅助（仅供自动化验证交互路径）
 
+    /// 冒烟：进入第一个目录（验证面包屑让位 + 返回按钮可点）；等列表返回再进
+    func smokeEnterFirstDirectory() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self = self, let dir = self.entries.first(where: { $0.isDirectory }) else { return }
+            self.enter(dir)
+        }
+    }
+
     func smokeSelectFirstFiles(_ n: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
             guard let self = self else { return }
@@ -436,7 +449,8 @@ final class TVBrowserView: NSView {
         super.viewDidMoveToWindow()
         if window != nil && keyMonitor == nil {
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard let self = self, self.window != nil,
+                guard let self = self,
+                      event.window === self.window, // 只拦本窗口的按键，别吞掉 sheet 里的 Esc
                       self.superview != nil,
                       !(self.window?.firstResponder is NSTextView) else { return event }
                 let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -551,7 +565,7 @@ final class TVFileCell: NSCollectionViewItem {
             checkMark.heightAnchor.constraint(equalToConstant: 20),
         ])
 
-        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .inVisibleRect, .activeInKeyWindow], owner: nil, userInfo: nil)
+        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .inVisibleRect, .activeInKeyWindow], owner: self, userInfo: nil)
         container.addTrackingArea(tracking)
     }
 
@@ -719,18 +733,19 @@ final class GlassActionBar: NSView {
 
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
-        for b in [downloadBtn, deleteBtn, restoreBtn] as [NSView] {
-            b.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(b)
-        }
         restoreBtn.isHidden = true
         closeBtn.isBordered = false
         closeBtn.imagePosition = .imageOnly
         closeBtn.contentTintColor = .secondaryLabelColor
         closeBtn.target = self
         closeBtn.action = #selector(closeTapped)
-        closeBtn.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(closeBtn)
+
+        // 按钮进 NSStackView：隐藏的按钮自动退出布局，不再需要宽度占位/三元约束技巧
+        let buttonRow = NSStackView(views: [restoreBtn, downloadBtn, deleteBtn, closeBtn])
+        buttonRow.orientation = .horizontal
+        buttonRow.spacing = 10
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(buttonRow)
 
         downloadBtn.tapAction = { [weak self] in self?.onDownload?() }
         deleteBtn.tapAction = { [weak self] in self?.onDelete?() }
@@ -744,17 +759,10 @@ final class GlassActionBar: NSView {
 
             label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
-            label.trailingAnchor.constraint(lessThanOrEqualTo: restoreBtn.leadingAnchor, constant: -8),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: buttonRow.leadingAnchor, constant: -8),
 
-            restoreBtn.centerYAnchor.constraint(equalTo: centerYAnchor),
-            downloadBtn.centerYAnchor.constraint(equalTo: centerYAnchor),
-            deleteBtn.centerYAnchor.constraint(equalTo: centerYAnchor),
-            closeBtn.centerYAnchor.constraint(equalTo: centerYAnchor),
-            closeBtn.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            deleteBtn.trailingAnchor.constraint(equalTo: closeBtn.leadingAnchor, constant: -10),
-            downloadBtn.trailingAnchor.constraint(equalTo: deleteBtn.leadingAnchor, constant: -10),
-            restoreBtn.trailingAnchor.constraint(equalTo: downloadBtn.leadingAnchor, constant: -10),
-            restoreBtn.isHidden ? restoreBtn.widthAnchor.constraint(equalToConstant: 0) : restoreBtn.widthAnchor.constraint(greaterThanOrEqualToConstant: 10),
+            buttonRow.centerYAnchor.constraint(equalTo: centerYAnchor),
+            buttonRow.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
         ])
 
         heightAnchor.constraint(greaterThanOrEqualToConstant: 46).isActive = true

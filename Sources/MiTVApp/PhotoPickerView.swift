@@ -33,7 +33,7 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
 
     func present(asSheetOf parent: NSWindow) {
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
-                           styleMask: [.titled, .fullSizeContentView],
+                           styleMask: [.titled, .closable, .fullSizeContentView],
                            backing: .buffered, defer: false)
         win.title = "从照片图库挑选"
         win.titlebarAppearsTransparent = true
@@ -82,6 +82,7 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
         root.addSubview(bar)
         bar.configureAsPhotoPicker(addAction: { [weak self] in self?.exportSelected() })
         bar.onClose = { [weak self] in self?.close() }
+        bar.isHidden = false // 常驻底部：未选择时也能点 ✕ 关闭
 
         emptyLabel.isHidden = true
         emptyLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -203,7 +204,7 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
     }
 
     private func updateBar() {
-        bar.isHidden = selected.isEmpty
+        bar.isHidden = false // 选择器模式常驻（浏览器模式才按选中显隐）
         bar.setPhotoPickerCount(selected.count)
     }
 
@@ -368,7 +369,7 @@ final class PhotoCell: NSCollectionViewItem {
             checkMark.widthAnchor.constraint(equalToConstant: 20),
             checkMark.heightAnchor.constraint(equalToConstant: 20),
         ])
-        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .inVisibleRect, .activeInKeyWindow], owner: nil, userInfo: nil)
+        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .inVisibleRect, .activeInKeyWindow], owner: self, userInfo: nil)
         container.addTrackingArea(tracking)
     }
 

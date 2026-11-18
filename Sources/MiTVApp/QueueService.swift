@@ -65,12 +65,18 @@ final class QueueService {
                     if it.phase == .running || it.phase == .connecting {
                         it.phase = .queued
                         it.bytesPerSecond = 0
+                        it.bytes = 0 // 上次会话的进度对新一轮传输无意义（防 progress max() 卡在旧值）
                     }
                     return it
                 }
             }
         }
         if !items.isEmpty {
+            // 重启恢复：已经是整批终态的批次视为已通知，不再重复发完成庆祝（声音/系统通知/弹跳）
+            for (b, members) in Dictionary(grouping: items, by: { $0.batchId })
+            where !members.isEmpty && members.allSatisfy({ $0.phase.isTerminal }) {
+                batchNotified.insert(b)
+            }
             stateQ.async { [weak self] in
                 self?.notifyChange()
                 self?.scheduleIfNeeded()
@@ -286,40 +292,89 @@ final class QueueService {
         case .download:
             startDownload(item, endpoint: endpoint, handle: handle)
         case .upload:
-            // 智能分流：先看根目录
+            // 重试/断线恢复的项沿用已定目标（SIZE+APPE 续传语义），不再重新分流
+            if item.remotePath != nil {
+                startUpload(id, handle: handle)
+                return
+            }
+            // 智能分流：先看根目录定目标文件夹
             engineProvider().list(endpoint, path: "/") { [weak self] result in
                 guard let self = self else { return }
-                self.stateQ.async { self.routeAndUpload(id, rootEntries: result, handle: handle) }
+                self.stateQ.async { self.chooseUploadDir(id, rootEntries: result, handle: handle) }
             }
         }
     }
 
-    private func routeAndUpload(_ id: String, rootEntries: Result<[FTPFileEntry], Error>, handle: TransferHandle) {
+    /// 智能分流第一步：根目录列表 → 目标文件夹（Movies/Pictures/根）
+    private func chooseUploadDir(_ id: String, rootEntries: Result<[FTPFileEntry], Error>, handle: TransferHandle) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
-        guard items[idx].phase == .connecting else { return }
-        guard case .success(let entries) = rootEntries else {
+        guard items[idx].phase == .connecting else { return } // 可能已被暂停/取消
+        guard case .success(let root) = rootEntries else {
             finishWithEngineError(id: id, error: rootEntries.failureError ?? EngineError.connectionFailed("无法读取电视文件列表"))
             return
         }
-        let dir = SmartRouting.destinationDir(kind: items[idx].kind, rootEntries: entries)
-        let target = SmartRouting.remoteTarget(displayName: items[idx].displayName,
-                                               dir: dir,
-                                               existingNames: SmartRouting.existingNames(entries: entries))
-        items[idx].remoteDir = dir
-        items[idx].remotePath = target.path
-        items[idx].needsNameMapping = target.needsMapping
-        items[idx] = QueueStateMachine.apply(.startRunning, to: items[idx])
-        persistLocked()
-        notifyChange()
-
+        let dir = SmartRouting.destinationDir(kind: items[idx].kind, rootEntries: root)
+        if dir == "/" {
+            finalizeUploadRouting(id, dir: dir, dirEntries: rootEntries, handle: handle)
+            return
+        }
         guard let endpoint = endpointProvider() else {
             finishWithEngineError(id: id, error: EngineError.notConnected)
             return
         }
+        // 重名顺延必须依据【目标目录】里的已有文件——只看根目录会让 /Movies 里的同名文件被静默覆盖
+        engineProvider().list(endpoint, path: dir) { [weak self] dirResult in
+            guard let self = self else { return }
+            self.stateQ.async { self.finalizeUploadRouting(id, dir: dir, dirEntries: dirResult, handle: handle) }
+        }
+    }
+
+    /// 智能分流第二步：目标目录列表 → 唯一化远端路径 → 起传
+    private func finalizeUploadRouting(_ id: String, dir: String,
+                                       dirEntries: Result<[FTPFileEntry], Error>, handle: TransferHandle) {
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        guard items[idx].phase == .connecting else { return }
+        guard case .success(let dirList) = dirEntries else {
+            // 目标目录读不到就不盲传——宁可失败也不覆盖
+            finishWithEngineError(id: id, error: dirEntries.failureError ?? EngineError.connectionFailed("无法读取目标文件夹"))
+            return
+        }
+        // 并发互斥：其他未终结上传项已占用的远端名也计入（各项回调在 stateQ 串行处理，无竞态）
+        let inflight = Set(items.compactMap { other -> String? in
+            guard other.id != id, other.direction == .upload, !other.phase.isTerminal,
+                  let p = other.remotePath else { return nil }
+            return (p as NSString).lastPathComponent
+        })
+        let existing = SmartRouting.existingNames(entries: dirList).union(inflight)
+        let target = SmartRouting.remoteTarget(displayName: items[idx].displayName,
+                                               dir: dir,
+                                               existingNames: existing)
+        items[idx].remoteDir = dir
+        items[idx].remotePath = target.path
+        items[idx].needsNameMapping = target.needsMapping
+        startUpload(id, handle: handle)
+    }
+
+    private func startUpload(_ id: String, handle: TransferHandle) {
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        guard items[idx].phase == .connecting else { return } // 可能已被暂停/取消
+        guard let target = items[idx].remotePath else {
+            // 理论不可达（调用方保证已分流）；兜底置失败，避免项卡死在 connecting
+            finishWithEngineError(id: id, error: EngineError.connectionFailed("传输目标未确定，请重试"))
+            return
+        }
+        guard let endpoint = endpointProvider() else {
+            finishWithEngineError(id: id, error: EngineError.notConnected)
+            return
+        }
+        items[idx] = QueueStateMachine.apply(.startRunning, to: items[idx])
+        persistLocked()
+        notifyChange()
+
         let resume = capabilitiesProvider()?.appeResume == true
         engineProvider().upload(endpoint,
                                 from: items[idx].localURL,
-                                to: target.path,
+                                to: target,
                                 resume: resume,
                                 handle: handle,
                                 onProgress: { [weak self] progress in

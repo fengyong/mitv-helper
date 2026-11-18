@@ -27,3 +27,10 @@ rm -rf /tmp/mitv-e2e-*
 | `/tmp/mitv-app-run.log` `/tmp/mitv-app-upload.log` | App 集成冒烟日志 |
 | `/tmp/mitv-e2e-img.jpg` `/tmp/mitv-e2e-clip.mp4` | App 上传验收测试媒体 |
 | `~/Library/Application Support/MiTVHelper/` | 运行时配置（App 正常使用位置，不清理；`tv.json` 由演示预置改为真实电视端点） |
+
+## 2026-11-19 深度 review 修复轮（glm53flash）
+
+| 路径 | 说明 |
+|---|---|
+| `/tmp/mitv-smoke-*` `/tmp/mitv-review-probe/` `/tmp/mitv-*.log` `/tmp/mitv-final-launch.png` `/tmp/mitv-smoke-clip.mp4` | 本轮冒烟/探针/构建日志产物（均在 /tmp，重启自清，可手动删） |
+| `~/Library/Application Support/MiTVHelper/queue.json` | 曾被冒烟误写入 5 条垃圾失败项，已清回 `[]`（tv.json/trash.json 未动；trash.json 里此前的 15 条软删除记录仍保留，可在 App 回收站还原） |

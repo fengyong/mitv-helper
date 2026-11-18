@@ -22,8 +22,9 @@ final class SettingsController: NSObject, NSWindowDelegate {
 
     func present(asSheetOf parent: NSWindow, onClose: @escaping () -> Void) {
         self.onClose = onClose
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 470, height: 330),
-                           styleMask: [.titled, .fullSizeContentView],
+        // .closable 必须有：否则没有关闭按钮，Esc 也不会触发关闭
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 470, height: 400),
+                           styleMask: [.titled, .closable, .fullSizeContentView],
                            backing: .buffered, defer: false)
         win.title = "设置"
         win.titlebarAppearsTransparent = true
@@ -34,16 +35,20 @@ final class SettingsController: NSObject, NSWindowDelegate {
         root.translatesAutoresizingMaskIntoConstraints = false
         win.contentView = root
 
-        let content = NSView()
-        content.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(content)
+        // 内容可能超出一屏：包一层滚动
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        scroll.scrollerStyle = .overlay
+        root.addSubview(scroll)
 
         let title = UIUtil.label("设置", size: 18, weight: .semibold)
 
         let tvTitle = UIUtil.label("电视", size: 13, weight: .semibold, color: .secondaryLabelColor)
         let reconnect = CapsuleButton("重新连接向导", style: .secondary)
         reconnect.tapAction = { [weak self] in
-            self?.window?.sheetParent?.endSheet(self!.window!)
+            self?.closeSheet()
             self?.coordinator.showOnboarding()
         }
 
@@ -75,12 +80,16 @@ final class SettingsController: NSObject, NSWindowDelegate {
         soundToggle.action = #selector(soundChanged)
         soundToggle.state = UserDefaults.standard.bool(forKey: "soundOnComplete") ? .on : .off
 
+        let doneButton = CapsuleButton("完成", style: .primary)
+        doneButton.tapAction = { [weak self] in self?.closeSheet() }
+
         let stack = NSStackView(views: [
             title,
             tvTitle, tvInfoLabel, reconnect,
             queueTitle, concLabel, concurrencyPopup,
             pathTitle, pathText,
             engineTitle, demoToggle, notifyToggle, soundToggle,
+            doneButton,
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -91,21 +100,23 @@ final class SettingsController: NSObject, NSWindowDelegate {
         stack.setCustomSpacing(16, after: pathText)
         stack.setCustomSpacing(16, after: soundToggle)
         stack.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(stack)
+        scroll.documentView = stack
+        pathText.preferredMaxLayoutWidth = 418 // 滚动视图内换行标签需要显式宽度
 
         let name = coordinator.store.state.tvName ?? "电视"
         let addr = coordinator.store.endpoint?.display ?? "未连接"
         tvInfoLabel.stringValue = "当前：\(name) · \(addr)"
 
         NSLayoutConstraint.activate([
-            content.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
-            content.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
-            content.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
-            content.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
+            scroll.topAnchor.constraint(equalTo: root.topAnchor, constant: 32),
+            scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
 
-            stack.topAnchor.constraint(equalTo: content.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            // 文档视图钉住顶/左/右（宽度=可视宽度），高度随内容自由伸展 → 垂直可滚
+            stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor, constant: 2),
+            stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
         ])
 
         parent.beginSheet(win) { [weak self] _ in
@@ -113,6 +124,11 @@ final class SettingsController: NSObject, NSWindowDelegate {
             self.onClose?()
             self.window = nil
         }
+    }
+
+    private func closeSheet() {
+        guard let w = window else { return }
+        w.sheetParent?.endSheet(w)
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -151,6 +167,8 @@ final class ConfirmOverlay: NSView {
 
     private var onConfirm: ((Bool) -> Void)?
     private var isHard = false
+    /// disabled 策略（电视不支持删除）：确认按钮只做提示关闭，不触发删除流程
+    private var notifyOnly = false
     private var downloadFirst = false
     private var dismissCompletion: (() -> Void)?
 
@@ -225,6 +243,7 @@ final class ConfirmOverlay: NSView {
             downloadCheck.action = #selector(toggleDownloadFirst)
         case .disabled:
             isHard = true
+            notifyOnly = true
             titleLabel.stringValue = "这台电视不支持删除"
             subLabel.stringValue = "电视没有开放删除能力，请直接在电视上操作"
             confirmButton.title = "知道了"
@@ -235,6 +254,10 @@ final class ConfirmOverlay: NSView {
         cancelButton.tapAction = { [weak self] in self?.dismiss() }
         confirmButton.tapAction = { [weak self] in
             guard let self = self else { return }
+            if self.notifyOnly {
+                self.dismiss()
+                return
+            }
             let download = self.isHard && self.downloadCheck.state == .on
             self.dismiss()
             self.onConfirm?(download)

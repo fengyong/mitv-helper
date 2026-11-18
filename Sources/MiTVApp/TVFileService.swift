@@ -116,12 +116,18 @@ final class TVFileService {
                                   trashDirExists: trashDirExists)
     }
 
-    /// 批量删除。progress(done, total, name) 主队列；completion 返回成功记账（撤销用）。
+    /// 批量删除结果：成功记账（撤销用）+ 失败名单（部分失败如实上报，不再被吞掉）
+    struct DeleteOutcome {
+        let records: [TrashStore.Record]
+        let failedNames: [String]
+    }
+
+    /// 批量删除。progress(done, total, name) 主队列；completion 返回成功记账与失败名单。
     func deleteEntries(_ entries: [FTPFileEntry],
                        progress: @escaping (_ done: Int, _ total: Int, _ name: String) -> Void,
-                       completion: @escaping (Result<[TrashStore.Record], Error>) -> Void) {
+                       completion: @escaping (Result<DeleteOutcome, Error>) -> Void) {
         let files = entries.filter { !$0.isDirectory }
-        guard !files.isEmpty else { completion(.success([])); return }
+        guard !files.isEmpty else { completion(.success(DeleteOutcome(records: [], failedNames: []))); return }
         guard let endpoint = endpointProvider() else {
             completion(.failure(EngineError.notConnected))
             return
@@ -167,17 +173,13 @@ final class TVFileService {
     private func softDelete(_ files: [FTPFileEntry], form: DeleteStrategy.TrashForm,
                             endpoint: FTPEndpoint, engine: TransferEngine,
                             progress: @escaping (Int, Int, String) -> Void,
-                            completion: @escaping (Result<[TrashStore.Record], Error>) -> Void) {
+                            completion: @escaping (Result<DeleteOutcome, Error>) -> Void) {
         var records: [TrashStore.Record] = []
         var failedNames: [String] = []
         let total = files.count
         func step(_ i: Int) {
             guard i < total else {
-                if records.isEmpty && !failedNames.isEmpty {
-                    DispatchQueue.main.async { completion(.failure(EngineError.permissionDenied(failedNames.joined(separator: "、")))) }
-                } else {
-                    DispatchQueue.main.async { completion(.success(records)) }
-                }
+                DispatchQueue.main.async { completion(.success(DeleteOutcome(records: records, failedNames: failedNames))) }
                 return
             }
             let entry = files[i]
@@ -211,16 +213,12 @@ final class TVFileService {
 
     private func hardDelete(_ files: [FTPFileEntry], endpoint: FTPEndpoint, engine: TransferEngine,
                             progress: @escaping (Int, Int, String) -> Void,
-                            completion: @escaping (Result<[TrashStore.Record], Error>) -> Void) {
+                            completion: @escaping (Result<DeleteOutcome, Error>) -> Void) {
         var failedNames: [String] = []
         let total = files.count
         func step(_ i: Int) {
             guard i < total else {
-                if failedNames.isEmpty {
-                    DispatchQueue.main.async { completion(.success([])) }
-                } else {
-                    DispatchQueue.main.async { completion(.failure(EngineError.permissionDenied(failedNames.joined(separator: "、")))) }
-                }
+                DispatchQueue.main.async { completion(.success(DeleteOutcome(records: [], failedNames: failedNames))) }
                 return
             }
             let entry = files[i]
@@ -343,16 +341,15 @@ extension FTPFileEntry {
 }
 
 extension NSImage {
-    /// 等比缩到 maxPixel 内（供网格缩略）
+    /// 等比缩到 maxPixel 内（供网格缩略）。from 必须传 .zero（整图）——传固定矩形会变成裁切。
     func scaled(maxPixel: CGFloat) -> NSImage? {
-        let maxSize = CGSize(width: maxPixel, height: maxPixel)
         let ratio = min(maxPixel / max(size.width, 1), maxPixel / max(size.height, 1), 1)
         let target = NSSize(width: size.width * ratio, height: size.height * ratio)
         guard target.width > 1, target.height > 1 else { return nil }
         let img = NSImage(size: target)
         img.lockFocus()
         draw(in: NSRect(origin: .zero, size: target),
-             from: NSRect(origin: .zero, size: maxSize),
+             from: .zero,
              operation: .copy, fraction: 1.0)
         img.unlockFocus()
         img.isTemplate = false

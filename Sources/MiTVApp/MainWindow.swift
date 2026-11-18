@@ -235,6 +235,8 @@ final class BannerView: NSView {
     private let spinner = NSProgressIndicator()
     private let label = UIUtil.label("", size: 12, weight: .medium, color: NSColor(red: 0.45, green: 0.32, blue: 0.02, alpha: 1))
     private var heightConstraint: NSLayoutConstraint!
+    /// hide 的延迟收尾用 token 作废：show/hide 快速交替时旧的收尾不得隐藏新黄条
+    private var hideToken = 0
 
     init() {
         super.init(frame: .zero)
@@ -261,6 +263,7 @@ final class BannerView: NSView {
     required init?(coder: NSCoder) { fatalError("不支持") }
 
     func show(_ text: String) {
+        hideToken &+= 1 // 作废未决的 hide 收尾
         isHidden = false
         label.stringValue = text
         spinner.startAnimation(nil)
@@ -270,8 +273,10 @@ final class BannerView: NSView {
     func hide() {
         spinner.stopAnimation(nil)
         heightConstraint.animator().constant = 0
+        let token = hideToken
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.isHidden = true
+            guard let self = self, token == self.hideToken else { return }
+            self.isHidden = true
         }
     }
 }
@@ -311,6 +316,6 @@ final class StatusBarView: NSView {
 
     func set(left: String, right: String? = nil) {
         leftLabel.stringValue = left
-        if let r = right { rightLabel.stringValue = r }
+        rightLabel.stringValue = right ?? "" // nil 必须清空，否则「排队 N 项」残留
     }
 }

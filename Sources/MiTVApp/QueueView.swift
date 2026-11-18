@@ -374,7 +374,7 @@ final class QueueCardView: NSView {
             doneBadge.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
 
-        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .inVisibleRect, .activeInKeyWindow], owner: nil, userInfo: nil)
+        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .inVisibleRect, .activeInKeyWindow], owner: self, userInfo: nil)
         addTrackingArea(tracking)
     }
 
