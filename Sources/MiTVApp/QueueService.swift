@@ -16,7 +16,7 @@ final class QueueService {
     private let endpointProvider: () -> FTPEndpoint?
     private let capabilitiesProvider: () -> Capabilities?
     private let persistenceURL: URL
-    let concurrency: Int
+    var concurrency: Int
     private let resumeOnStart: Bool
 
     // MARK: 回调（统一主队列）
@@ -206,6 +206,14 @@ final class QueueService {
             }
             persistLocked(force: true)
             notifyChange()
+            scheduleIfNeeded()
+        }
+    }
+
+    /// 运行中调整并发数（设置页）
+    func setConcurrency(_ n: Int) {
+        stateQ.sync {
+            concurrency = max(1, n)
             scheduleIfNeeded()
         }
     }

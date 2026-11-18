@@ -1,7 +1,10 @@
 import AppKit
-import Foundation
 
-// 骨架占位：由 UI Agent 整体替换为实现版应用入口。
+// MARK: - 应用入口（NSApplication 装配 + Dock 拖放入队）
+
 let app = NSApplication.shared
+let appDelegate = AppDelegate()
+app.delegate = appDelegate
 app.setActivationPolicy(.regular)
-print("MiTVApp skeleton — UI pending")
+app.mainMenu = AppDelegate.buildMainMenu()
+app.run()
