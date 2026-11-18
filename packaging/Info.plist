@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key><string>MiTV Helper</string>
+	<key>CFBundleDisplayName</key><string>MiTV Helper</string>
+	<key>CFBundleIdentifier</key><string>local.mitv.helper</string>
+	<key>CFBundleVersion</key><string>0.1.0</string>
+	<key>CFBundleShortVersionString</key><string>0.1.0</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleExecutable</key><string>MiTVHelper</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>LSMinimumSystemVersion</key><string>10.15</string>
+	<key>NSHighResolutionCapable</key><true/>
+	<key>NSHumanReadableCopyright</key><string>MIT</string>
+	<key>NSPrincipalClass</key><string>NSApplication</string>
+	<!-- 照片库访问（自定义 Photos 框架选择器） -->
+	<key>NSPhotoLibraryUsageDescription</key><string>用于从照片图库挑选要发送到电视的照片和视频。</string>
+	<key>NSPhotoLibraryAddUsageDescription</key><string>用于保存从电视取回的照片。</string>
+	<!-- 局域网（FTP 到电视） -->
+	<key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoads</key><true/></dict>
+	<!-- 接收图片/视频文件（Finder/Dock 拖放） -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key><string>Media File</string>
+			<key>CFBundleTypeRole</key><string>Viewer</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.image</string>
+				<string>public.movie</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

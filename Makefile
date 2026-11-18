@@ -1,0 +1,58 @@
+# MiTV Helper 构建系统（无 Xcode；系统 Swift 5.1 + CLT 10.15 SDK，官方匹配对）
+# 用法：make / make app / make cli / make test / make appbundle / make clean
+# 注意：不要删除 build/ 之外的任何东西；临时文件记录在 docs/DELETE_PENDING.md
+
+SDK        := /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+SWIFT      := /usr/bin/swiftc
+TARGET     := x86_64-apple-macos10.15
+MODULECACHE := /tmp/mitv-modcache-51
+FLAGS      := -sdk $(SDK) -target $(TARGET) -Xcc -fmodules-cache-path=$(MODULECACHE) -O -enable-testing
+FLAGS_DEBUG:= -sdk $(SDK) -target $(TARGET) -Xcc -fmodules-cache-path=$(MODULECACHE) -g -DDEBUG -enable-testing
+
+CORE   := $(wildcard Sources/MiTVCore/*.swift)
+ENGINE := $(wildcard Sources/MiTVEngine/*.swift)
+APP    := $(wildcard Sources/MiTVApp/*.swift)
+CLI    := $(wildcard Sources/mitvctl/*.swift)
+TESTS  := $(wildcard Tests/MiTVCoreTests/*.swift)
+
+.PHONY: all app cli test appbundle clean typecheck
+
+all: cli test app
+
+# 无头 CLI（引擎端到端冒烟）
+cli: build/mitvctl
+
+build/mitvctl: $(CORE) $(ENGINE) $(CLI)
+	@mkdir -p build
+	$(SWIFT) $(FLAGS) -module-name mitvctl $(CORE) $(ENGINE) $(CLI) -framework Network -framework Foundation -o $@
+
+# macOS 客户端
+app: build/MiTVApp
+
+build/MiTVApp: $(CORE) $(ENGINE) $(APP)
+	@mkdir -p build
+	$(SWIFT) $(FLAGS) -module-name MiTVApp $(CORE) $(ENGINE) $(APP) \
+	  -framework AppKit -framework AVFoundation -framework Photos -framework Network -o $@
+
+# 测试（轻量自研 runner，不用 XCTest；失败非零退出）
+test: build/test-runner
+	./build/test-runner
+
+build/test-runner: $(CORE) $(TESTS)
+	@mkdir -p build
+	$(SWIFT) $(FLAGS) -module-name MiTVTests $(CORE) $(TESTS) -framework Foundation -o $@
+
+# 快速类型检查（不产出二进制，CI 心跳用）
+typecheck:
+	$(SWIFT) $(FLAGS_DEBUG) -module-name MiTVApp $(CORE) $(ENGINE) $(APP) -framework AppKit -framework AVFoundation -framework Photos -framework Network -typecheck
+
+# .app 打包
+appbundle: app
+	@mkdir -p dist/MiTVHelper.app/Contents/MacOS dist/MiTVHelper.app/Contents/Resources
+	cp packaging/Info.plist dist/MiTVHelper.app/Contents/Info.plist
+	printf 'APPL????' > dist/MiTVHelper.app/Contents/PkgInfo
+	cp build/MiTVApp dist/MiTVHelper.app/Contents/MacOS/MiTVHelper
+	@echo "dist/MiTVHelper.app 就绪 — open dist/MiTVHelper.app"
+
+clean:
+	rm -rf build

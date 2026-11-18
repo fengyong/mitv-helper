@@ -7,3 +7,9 @@ DerivedData/
 xcuserdata/
 *.xcodeproj/project.xcworkspace/
 *.xcodeproj/xcuserdata/
+
+# 工具链与本地产物（见 docs/DELETE_PENDING.md）
+.tools/
+build/
+dist/
+*.log
