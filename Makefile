@@ -51,12 +51,14 @@ build/test-runner: $(CORE) $(ENGINE) $(TESTS) $(APP_SERVICE)
 typecheck:
 	$(SWIFT) $(FLAGS_DEBUG) -module-name MiTVApp $(CORE) $(ENGINE) $(APP) -framework AppKit -framework AVFoundation -framework Photos -framework Network -typecheck
 
-# .app 打包
+# .app 打包（ad-hoc 签名：TCC 归属 Info.plist 权限文案必需，否则照片库授权直接 SIGABRT）
 appbundle: app
 	@mkdir -p dist/MiTVHelper.app/Contents/MacOS dist/MiTVHelper.app/Contents/Resources
 	cp packaging/Info.plist dist/MiTVHelper.app/Contents/Info.plist
 	printf 'APPL????' > dist/MiTVHelper.app/Contents/PkgInfo
 	cp build/MiTVApp dist/MiTVHelper.app/Contents/MacOS/MiTVHelper
+	codesign --force --deep --sign - dist/MiTVHelper.app 2>/dev/null || \
+	  echo "警告：codesign 失败，照片库授权可能被 TCC 拒绝"
 	@echo "dist/MiTVHelper.app 就绪 — open dist/MiTVHelper.app"
 
 clean:

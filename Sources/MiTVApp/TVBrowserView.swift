@@ -235,21 +235,32 @@ final class TVBrowserView: NSView {
         isTrashMode ? trashRecords.count : entries.filter { !$0.isDirectory }.count
     }
 
-    private func itemID(at index: Int) -> String {
-        if isTrashMode { return trashRecords[index].id }
-        let filesOnly = entries.filter { !$0.isDirectory }
-        return filesOnly[index].path
+    /// 全量数组下标 → 可选中项 ID。目录不可选返回 nil；越界（列表已刷新后的陈旧点击）返回 nil。
+    /// 修复：单元格闭包传的是 entries 全量下标（含目录），此前误按纯文件数组取值导致错位与越界崩溃。
+    private func itemID(at index: Int) -> String? {
+        if isTrashMode {
+            guard trashRecords.indices.contains(index) else { return nil }
+            return trashRecords[index].id
+        }
+        guard entries.indices.contains(index) else { return nil }
+        let entry = entries[index]
+        return entry.isDirectory ? nil : entry.path
+    }
+
+    /// 纯文件（或回收站记录）的 ID 集——全选与校验用，避免下标空间混用
+    private var selectableIDs: [String] {
+        isTrashMode ? trashRecords.map { $0.id } : entries.filter { !$0.isDirectory }.map { $0.path }
     }
 
     func toggleSelect(at index: Int) {
-        let id = itemID(at: index)
+        guard let id = itemID(at: index) else { return }
         if selected.contains(id) { selected.remove(id) } else { selected.insert(id) }
         anchorIndex = index
         refreshSelectionUI()
     }
 
     func singleSelect(at index: Int) {
-        let id = itemID(at: index)
+        guard let id = itemID(at: index) else { return }
         selected = [id]
         anchorIndex = index
         refreshSelectionUI()
@@ -259,12 +270,12 @@ final class TVBrowserView: NSView {
         guard let anchor = anchorIndex else { singleSelect(at: index); return }
         let lo = min(anchor, index)
         let hi = max(anchor, index)
-        selected = Set((lo...hi).map { itemID(at: $0) })
+        selected = Set((lo...hi).compactMap { itemID(at: $0) })
         refreshSelectionUI()
     }
 
     func selectAll() {
-        selected = Set((0..<selectableCount).map { itemID(at: $0) })
+        selected = Set(selectableIDs)
         refreshSelectionUI()
     }
 
@@ -275,8 +286,7 @@ final class TVBrowserView: NSView {
     }
 
     private func validateSelection() {
-        let valid = Set((0..<selectableCount).map { itemID(at: $0) })
-        selected = selected.intersection(valid)
+        selected = selected.intersection(Set(selectableIDs))
     }
 
     private func refreshSelectionUI() {
