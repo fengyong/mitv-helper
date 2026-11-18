@@ -14,6 +14,10 @@ ENGINE := $(wildcard Sources/MiTVEngine/*.swift)
 APP    := $(wildcard Sources/MiTVApp/*.swift)
 CLI    := $(wildcard Sources/mitvctl/*.swift)
 TESTS  := $(wildcard Tests/MiTVCoreTests/*.swift)
+# ServiceTests_B 直测的服务层纯逻辑文件（正式纳入替代临时符号链接方案）
+APP_SERVICE := Sources/MiTVApp/QueueModel.swift Sources/MiTVApp/QueueService.swift \
+               Sources/MiTVApp/SmartRouting.swift Sources/MiTVApp/SoftDeletePolicy.swift \
+               Sources/MiTVApp/TVStore.swift
 
 .PHONY: all app cli test appbundle clean typecheck
 
@@ -35,13 +39,13 @@ build/MiTVApp: $(CORE) $(ENGINE) $(APP)
 	  -framework AppKit -framework AVFoundation -framework Photos -framework Network -o $@
 
 # 测试（轻量自研 runner，不用 XCTest；失败非零退出）
-# 注：测试目标需编译 $(ENGINE)——EngineTests_A 引擎单测引用 MiTVEngine 源码（单模块合并编译）
+# 注：测试目标需编译 $(ENGINE)（EngineTests_A）与 $(APP_SERVICE)（ServiceTests_B）——单模块合并编译
 test: build/test-runner
 	./build/test-runner
 
-build/test-runner: $(CORE) $(ENGINE) $(TESTS)
+build/test-runner: $(CORE) $(ENGINE) $(TESTS) $(APP_SERVICE)
 	@mkdir -p build
-	$(SWIFT) $(FLAGS) -module-name MiTVTests $(CORE) $(ENGINE) $(TESTS) -framework Foundation -o $@
+	$(SWIFT) $(FLAGS) -module-name MiTVTests $(CORE) $(ENGINE) $(TESTS) $(APP_SERVICE) -framework Foundation -o $@
 
 # 快速类型检查（不产出二进制，CI 心跳用）
 typecheck:
