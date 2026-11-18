@@ -17,3 +17,13 @@ rm -rf /Users/fengyong/drax-glm/mitv-helper-glm53flash/.tools
 pip3 uninstall -y pyftpdlib
 rm -rf /tmp/mitv-e2e-*
 ```
+
+## 集成阶段新增（2026-11-19）
+
+| 路径 | 说明 |
+|---|---|
+| `/tmp/mitv-e2e-test.bin` 等真机测试文件 | mitvctl 真机验收产物（已从电视删除） |
+| `/tmp/mitv-full.bin` `/tmp/mitv-half.bin` `/tmp/mitv-remote-verify.bin` | APPE 续传真机验证产物 |
+| `/tmp/mitv-app-run.log` `/tmp/mitv-app-upload.log` | App 集成冒烟日志 |
+| `/tmp/mitv-e2e-img.jpg` `/tmp/mitv-e2e-clip.mp4` | App 上传验收测试媒体 |
+| `~/Library/Application Support/MiTVHelper/` | 运行时配置（App 正常使用位置，不清理；`tv.json` 由演示预置改为真实电视端点） |

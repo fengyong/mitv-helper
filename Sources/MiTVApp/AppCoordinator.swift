@@ -129,7 +129,7 @@ final class AppCoordinator: NSObject {
 
     func startup() {
         UserDefaults.standard.register(defaults: [
-            "useMockEngine": true,
+            "useMockEngine": false,
             "notifyOnComplete": true,
             "soundOnComplete": true,
             "concurrency": 2,
@@ -144,8 +144,10 @@ final class AppCoordinator: NSObject {
         refreshHeader()
 
         if let endpoint = store.endpoint, store.state.onboardingDone {
+            FileHandle.standardError.write(Data("[diag] startup connect → \(endpoint.display)\n".utf8))
             connect(endpoint: endpoint, silent: true)
         } else {
+            FileHandle.standardError.write(Data("[diag] startup → onboarding (endpoint=\(store.endpoint?.display ?? "nil"), done=\(store.state.onboardingDone))\n".utf8))
             showOnboarding()
         }
         if queue.snapshot().isEmpty == false {
@@ -334,6 +336,7 @@ final class AppCoordinator: NSObject {
             self.connecting = false
             switch result {
             case .success(let caps):
+                FileHandle.standardError.write(Data("[diag] probe OK: dele=\(caps.deleteFile) rename=\(caps.rename)\n".utf8))
                 self.store.update {
                     $0.endpoint = endpoint
                     $0.capabilities = caps
@@ -347,6 +350,7 @@ final class AppCoordinator: NSObject {
                 if !silent { self.showToast("已连接电视") }
                 completion?(true, nil)
             case .failure(let error):
+                FileHandle.standardError.write(Data("[diag] probe FAIL: \(error.localizedDescription)\n".utf8))
                 self.heartbeatStatus = .off
                 self.refreshHeader()
                 completion?(false, error.localizedDescription)

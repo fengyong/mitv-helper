@@ -76,12 +76,15 @@ final class HeartbeatService {
     private func doPing() {
         guard let endpoint = endpointProvider() else {
             // 尚未连接电视：静默等待，不进入黄条状态
+            FileHandle.standardError.write(Data("[diag] heartbeat: no endpoint\n".utf8))
             setStatus(.off)
             schedulePing(heartbeatInterval)
             return
         }
+        FileHandle.standardError.write(Data("[diag] heartbeat ping → \(endpoint.display)\n".utf8))
         engineProvider().ping(endpoint) { [weak self] error in
             guard let self = self else { return }
+            FileHandle.standardError.write(Data("[diag] heartbeat result: \(error?.localizedDescription ?? "ok")\n".utf8))
             // 引擎契约：回调在主队列 → 跳回心跳队列改状态
             self.q.async { self.handleResult(ok: error == nil) }
         }
