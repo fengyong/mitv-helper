@@ -35,6 +35,7 @@ func assertNoThrow<T>(_ msg: String, _ body: () throws -> T, file: StaticString 
 
 let allSuites: [(String, () -> Void)] = [
     ("NameCodecTests", NameCodecTests.run),
+    ("ServiceTests_B", ServiceTests_B.run),
 ]
 
 for (name, suite) in allSuites {
