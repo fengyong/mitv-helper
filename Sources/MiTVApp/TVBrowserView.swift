@@ -774,7 +774,7 @@ final class GlassActionBar: NSView {
 
     func configureAsPhotoPicker(addAction: (() -> Void)?) {
         downloadBtn.title = "添加照片"
-        downloadBtn.tapAction = { [weak self] in self?.onDownload?() }
+        downloadBtn.tapAction = addAction
         deleteBtn.isHidden = true
         restoreBtn.isHidden = true
         label.stringValue = "已选 0 张"

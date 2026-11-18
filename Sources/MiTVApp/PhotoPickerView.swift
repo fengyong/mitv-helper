@@ -315,7 +315,7 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
         return cell
     }
 
-    func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPath: Set<IndexPath>) {
+    func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
         DispatchQueue.main.async { collectionView.deselectAll(nil) }
     }
 
