@@ -50,6 +50,10 @@ final class MockEngine: TransferEngine {
     init() {
         root = Node(name: "/", isDirectory: true)
         MockEngine.seedDefaultTree(into: root)
+        // 冒烟走查钩子：MITV_MOCK_MKDIR=1 → 探测矩阵 mkdir=true（走查「新建文件夹」按钮与 MKD 兜底）
+        if ProcessInfo.processInfo.environment["MITV_MOCK_MKDIR"] == "1" {
+            probeMatrix.mkdir = true
+        }
     }
 
     static func seedDefaultTree(into root: Node) {
@@ -233,8 +237,22 @@ final class MockEngine: TransferEngine {
 
     func makeDirectory(_ endpoint: FTPEndpoint, path: String, completion: @escaping (Error?) -> Void) {
         after(latency) {
-            // 实测矩阵：MKD 550 不可用
-            DispatchQueue.main.async { completion(EngineError.unsupported("建目录")) }
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            // 按探测矩阵分支：mkdir=false（真机 SwiFTP MKD 550 语义）→ unsupported；
+            // mkdir=true → 真实建目录（父级须存在、不得重名），供「新建文件夹」与智能分流自动归类走查
+            guard self.probeMatrix.mkdir else {
+                DispatchQueue.main.async { completion(EngineError.unsupported("建目录")) }
+                return
+            }
+            guard let parent = self.findParent(path), self.find(path) == nil else {
+                DispatchQueue.main.async { completion(EngineError.remoteNotFound(path)) }
+                return
+            }
+            let n = Node(name: (path as NSString).lastPathComponent, isDirectory: true)
+            n.parent = parent
+            parent.children.append(n)
+            DispatchQueue.main.async { completion(nil) }
         }
     }
 

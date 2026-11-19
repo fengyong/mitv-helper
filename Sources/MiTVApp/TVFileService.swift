@@ -48,6 +48,18 @@ final class TVFileService {
         }
     }
 
+    /// 建目录（MKD，选择存放位置弹窗用）。caps.mkdir=false 的设备上 UI 门控不发起；
+    /// 探测后能力变化的竞态在此如实失败（设计稿 v2 §5.2/D1）
+    func makeDirectory(_ path: String, completion: @escaping (Error?) -> Void) {
+        guard let endpoint = endpointProvider() else {
+            completion(EngineError.notConnected)
+            return
+        }
+        engineProvider().makeDirectory(endpoint, path: path) { error in
+            DispatchQueue.main.async { completion(error) }
+        }
+    }
+
     // MARK: 删除（直删 DELE，永久不可撤销）
 
     /// 当前能力下的删除策略（UI 用它决定按钮与文案）
