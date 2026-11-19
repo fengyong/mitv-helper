@@ -440,6 +440,9 @@ final class AppCoordinator: NSObject {
                 queue.autoResumeAfterReconnect()
                 showToast("电视已重新连接")
             }
+            // 心跳自动重连也是「下次连接」：删除失败保留的登记必须在这里续删，
+            // 否则 toast 承诺的自动重试只在重启/手动重连时兑现
+            catchUpPendingDeletes()
         case .lost(let attempt):
             yellowBannerUp = true
             banner.show("电视连接不上 · 正在重试（第 \(attempt) 次）… 文件已自动暂停")
