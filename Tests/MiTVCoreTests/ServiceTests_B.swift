@@ -227,6 +227,8 @@ enum ServiceTests_B {
         var failDeletePaths: Set<String> = []
         /// 指定路径的 delete 报 remoteNotFound（重启补删 tolerateMissing 测试用）
         var notFoundDeletePaths: Set<String> = []
+        /// 指定路径的 delete 报 ioError（未识别 550：文件可能还在，补删不得容忍）
+        var ioErrorDeletePaths: Set<String> = []
         private(set) var uploadHandles: [TransferHandle?] = []
         private(set) var downloadHandles: [TransferHandle?] = []
         /// true 时 upload 完成回调被扣住，供测试精确控制时序；false 时延迟自动成功/失败
@@ -328,9 +330,11 @@ enum ServiceTests_B {
             deleteCalls.append(remotePath)
             let fail = failDeletePaths.contains(remotePath)
             let notFound = notFoundDeletePaths.contains(remotePath)
+            let ioErr = ioErrorDeletePaths.contains(remotePath)
             lock.unlock()
             DispatchQueue.global().async {
                 if notFound { completion(EngineError.remoteNotFound(remotePath)) }
+                else if ioErr { completion(EngineError.ioError("550 Could not delete file")) }
                 else { completion(fail ? EngineError.permissionDenied("模拟删除失败") : nil) }
             }
         }
@@ -979,6 +983,19 @@ extension ServiceTests_B {
             waitMain("默认模式返回") { box2.done }
             assertEqual(box2.outcome?.deletedCount, 1, "默认不容忍 notFound")
             assertEqual(box2.outcome?.failedNames, ["a.mp4"], "默认模式 notFound 如实报失败")
+        }
+
+        // 7) fail-safe：ioError（未识别 550，文件可能还在）即使 tolerateMissing 也不计删成功
+        do {
+            let engine = InlineEngine()
+            engine.ioErrorDeletePaths = ["/Movies/a.mp4"]
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a, b], tolerateMissing: true, progress: { _, _, _ in }) { box.set($0) }
+            waitMain("ioError 补删返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 1, "ioError 不计删成功（fail-open 会谎报已删除）")
+            assertEqual(box.outcome?.failedNames, ["a.mp4"], "ioError 留失败名单 → 登记保留待重试")
         }
     }
 }

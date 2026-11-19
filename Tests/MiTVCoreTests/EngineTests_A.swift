@@ -199,6 +199,15 @@ enum EngineTests_A {
         let e4 = FTPErrorMapper.map(code: 550, text: "Could not create file.", op: .stor, cmd: "STOR")
         assertTrue(matches(e4) { if case .permissionDenied = $0 { return true }; return false },
                    "550 STOR 默认 → permissionDenied")
+        let e4b = FTPErrorMapper.map(code: 550, text: "Could not delete file", op: .dele, cmd: "DELE")
+        assertTrue(matches(e4b) { if case .ioError = $0 { return true }; return false },
+                   "550 DELE 无关键词 → ioError（文件可能还在，不得落 remoteNotFound 致补删误报成功）")
+        let e4c = FTPErrorMapper.map(code: 550, text: "No such file or directory.", op: .dele, cmd: "DELE")
+        assertTrue(matches(e4c) { if case .remoteNotFound = $0 { return true }; return false },
+                   "550 DELE 关键词命中 → remoteNotFound（补删幂等依赖）")
+        let e4d = FTPErrorMapper.map(code: 550, text: "File unavailable.", op: .retr, cmd: "RETR")
+        assertTrue(matches(e4d) { if case .remoteNotFound = $0 { return true }; return false },
+                   "550 读路径默认仍 remoteNotFound（不受 DELE 分支影响）")
         let e5 = FTPErrorMapper.map(code: 530, text: "Login incorrect.", op: .auth, cmd: "USER")
         assertTrue(matches(e5) { if case .authFailed = $0 { return true }; return false },
                    "530 → authFailed")

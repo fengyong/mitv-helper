@@ -94,6 +94,10 @@ enum FTPErrorMapper {
             switch op {
             case .stor, .appe, .mkd, .rnto, .rmd:
                 return .permissionDenied(text) // 写操作被拒（如 SwiFTP MKD 550）
+            case .dele:
+                // 未识别 550 不等于文件不存在（U 盘拔出/写保护也回 550）：
+                // 落 remoteNotFound 会被补删 tolerateMissing 计为删成功 → fail-open 谎报
+                return .ioError(text)
             default:
                 return .remoteNotFound(text)
             }
