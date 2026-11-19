@@ -424,7 +424,7 @@ final class AppCoordinator: NSObject {
         case .lost(let attempt):
             header.capsule.setLook(.lost, "\(name) · 连接不上，正在重试（第 \(attempt) 次）")
         case .off:
-            header.capsule.setLook(.off, store.endpoint == nil ? "未连接电视 · 点此连接" : "\(name) · 未连接")
+            header.capsule.setLook(.off, store.endpoint == nil ? "未连接电视 · 点此连接" : "\(name) · 连接不上 · 点此重连")
         }
         if mode == .browser, heartbeatStatus == .off, store.endpoint != nil {
             // 掉线时浏览态停留但列表不可操作（由浏览器自己展示空态）

@@ -26,7 +26,15 @@ final class TVBrowserView: NSView {
     private var breadcrumbLeading: NSLayoutConstraint!
     private let trashChip: CapsuleButton
     private let spinner = NSProgressIndicator()
-    private let emptyLabel = UIUtil.label("这个文件夹是空的", size: 14, color: .secondaryLabelColor, align: .center)
+    /// 空态/错误态文案（多行居中；错误时写原因与重连指引）
+    private let emptyLabel: NSTextField = {
+        let l = UIUtil.label("这个文件夹是空的", size: 14, color: .secondaryLabelColor, align: .center)
+        l.lineBreakMode = .byWordWrapping
+        l.usesSingleLineMode = false
+        l.maximumNumberOfLines = 0
+        l.preferredMaxLayoutWidth = 460
+        return l
+    }()
     private let collection = NSCollectionView()
     private let scroll = NSScrollView()
     private let actionBar = GlassActionBar()
@@ -168,7 +176,12 @@ final class TVBrowserView: NSView {
                 self.validateSelection()
             case .failure(let error):
                 self.entries = []
-                self.coordinator.showToast("暂时读不到电视文件：\(error.localizedDescription)")
+                self.trashRecords = []
+                // 连接类失败把原因和出路写进空态（toast 会被后续提示顶掉，空态才是可靠的主提示）
+                self.emptyLabel.stringValue = "暂时读不到电视文件\n\n\(error.localizedDescription)\n请确认电视上的「远程管理」还开着，点左上角状态可重连"
+                self.emptyLabel.isSelectable = false
+                self.emptyLabel.isHidden = false
+                self.coordinator.showToast("暂时读不到电视文件")
             }
             self.refreshChrome()
             self.collection.reloadData()
@@ -612,14 +625,15 @@ final class TVFileCell: NSCollectionViewItem {
             thumbView.image = LocalThumbnailLoader.fallbackIcon(for: entry.kind)
             thumbView.contentTintColor = .quaternaryLabelColor
         }
-        if !entry.isDirectory && entry.kind == .image {
+        if !entry.isDirectory && entry.kind != .other {
             files.fetchThumbnail(entry) { [weak self] img in
                 guard let self = self else { return }
                 if self.identifierKey == entry.path {
                     if let img = img {
                         self.thumbView.image = img
+                        self.thumbView.contentTintColor = nil
                     } else {
-                        self.thumbView.image = LocalThumbnailLoader.fallbackIcon(for: .image)
+                        self.thumbView.image = LocalThumbnailLoader.fallbackIcon(for: entry.kind)
                         self.thumbView.contentTintColor = .quaternaryLabelColor
                     }
                 }

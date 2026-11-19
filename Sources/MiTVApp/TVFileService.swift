@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import Foundation
 
@@ -303,9 +304,15 @@ final class TVFileService {
         return dir
     }
 
-    /// 远端图片缩略图（≤20MB 才取）；completion 主队列，失败给 nil（UI 用图标兜底）
+    /// 远端媒体缩略图。图片：整图下载（≤20MB）；视频：下载前 2MB 试帧
+    /// （moov 在头部的 MP4 可解出首帧；moov 在尾部的解不出 → 图标兜底 + 负缓存）。
+    /// completion 主队列，失败给 nil（UI 用图标兜底）。
     func fetchThumbnail(_ entry: FTPFileEntry, completion: @escaping (NSImage?) -> Void) {
-        guard !entry.isDirectory, entry.kind == .image, (entry.size ?? 1) <= maxThumbBytes else {
+        guard !entry.isDirectory, entry.kind == .image || entry.kind == .video, (entry.size ?? 1) > 0 else {
+            completion(nil)
+            return
+        }
+        if entry.kind == .image && (entry.size ?? 1) > maxThumbBytes {
             completion(nil)
             return
         }
@@ -331,6 +338,34 @@ final class TVFileService {
         guard let endpoint = endpointProvider() else {
             markNotFetching(entry.path); completion(nil); return
         }
+        let finish: (NSImage?) -> Void = { [weak self] img in
+            guard let self = self else { return }
+            self.markNotFetching(entry.path)
+            if let img = img {
+                self.thumbCache.setObject(img, forKey: key)
+            } else {
+                self.fetchLock.lock()
+                self.failedThumbs.insert(entry.path)
+                self.fetchLock.unlock()
+            }
+            try? FileManager.default.removeItem(at: localURL)
+            DispatchQueue.main.async { completion(img) }
+        }
+        if entry.kind == .video {
+            // 视频：读前 2MB 试帧（本机 AVAsset 能解就出首帧；moov 在尾部解不出 → nil 兜底）
+            engineProvider().downloadPrefix(endpoint, remotePath: entry.path, maxBytes: 2 * 1024 * 1024) { [weak self] result in
+                guard let self = self else { return }
+                switch result {
+                case .failure:
+                    finish(nil)
+                case .success(let data):
+                    try? data.write(to: localURL)
+                    let image = Self.firstFrame(from: localURL)?.scaled(maxPixel: 400) ?? nil
+                    finish(image)
+                }
+            }
+            return
+        }
         engineProvider().download(endpoint, remotePath: entry.path, to: localURL,
                                   handle: nil, onProgress: nil) { [weak self] result in
             guard let self = self else { return }
@@ -354,6 +389,16 @@ final class TVFileService {
         fetchLock.lock()
         fetchingPaths.remove(path)
         fetchLock.unlock()
+    }
+
+    /// 视频文件首帧（AVAssetImageGenerator；无法解码返回 nil）
+    private static func firstFrame(from url: URL) -> NSImage? {
+        let asset = AVURLAsset(url: url)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.maximumSize = CGSize(width: 400, height: 400)
+        guard let cg = try? gen.copyCGImage(at: .zero, actualTime: nil) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 }
 
