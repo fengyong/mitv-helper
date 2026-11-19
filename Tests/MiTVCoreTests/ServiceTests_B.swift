@@ -22,6 +22,7 @@ enum ServiceTests_B {
         testBatchNameCollisions()
         testStaleInflightRace()
         testBatchRetryRearm()
+        testCompletedSiblingBlindSpot()
         testThumbFetchSafety()
     }
 
@@ -255,6 +256,12 @@ enum ServiceTests_B {
         var remotePrefix: Data?
         /// downloadPrefix 回调延迟（拉宽异步窗口，复现过期 inflight 快照竞态用）
         var prefixDelay: TimeInterval = 0.02
+        /// LIST/SIZE 回调延迟序列（按调用次序消费，末值重复；nil=无延迟）：
+        /// 让兄弟项在另一项的 LIST/SIZE hop 期间完成，确定性复现定名盲区
+        var listDelays: [TimeInterval]?
+        var sizeDelays: [TimeInterval]?
+        private var listCallCount = 0
+        private var sizeCallCount = 0
         private var prefixCallCount = 0
         private let lock = NSLock()
 
@@ -281,7 +288,12 @@ enum ServiceTests_B {
 
         func ping(_ endpoint: FTPEndpoint, completion: @escaping (Error?) -> Void) { DispatchQueue.global().async { completion(nil) } }
         func list(_ endpoint: FTPEndpoint, path: String, completion: @escaping (Result<[FTPFileEntry], Error>) -> Void) {
-            DispatchQueue.global().async {
+            lock.lock()
+            let i = listCallCount; listCallCount += 1
+            let seq = listDelays
+            lock.unlock()
+            let delay = seq.map { $0[min(i, $0.count - 1)] } ?? 0
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
                 if self.failAllLists {
                     completion(.failure(EngineError.connectionFailed("模拟列表失败")))
                     return
@@ -346,7 +358,12 @@ enum ServiceTests_B {
             DispatchQueue.global().async { completion(self.allowMKD ? nil : EngineError.unsupported("MKD")) }
         }
         func size(_ endpoint: FTPEndpoint, remotePath: String, completion: @escaping (Result<Int64?, Error>) -> Void) {
-            DispatchQueue.global().async { completion(.success(self.remoteSizes[remotePath])) }
+            lock.lock()
+            let i = sizeCallCount; sizeCallCount += 1
+            let seq = sizeDelays
+            lock.unlock()
+            let delay = seq.map { $0[min(i, $0.count - 1)] } ?? 0
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { completion(.success(self.remoteSizes[remotePath])) }
         }
         func probeCapabilities(_ endpoint: FTPEndpoint, completion: @escaping (Result<Capabilities, Error>) -> Void) {
             DispatchQueue.global().async { completion(.success(Capabilities())) }
@@ -1215,5 +1232,62 @@ extension ServiceTests_B {
         assertEqual(third.ok, 2, "第三次回调：两项全部成功")
         assertEqual(third.bad, 0, "bad==0 才会触发续删")
         queue.suspendForShutdown()
+    }
+}
+
+// MARK: - 定名盲区：异步 hop 期间已完成的兄弟项（inflight 与 dirList 快照都看不见）
+
+extension ServiceTests_B {
+
+    /// 同名不同内容两份、远端无同名（无 clash → 用原名，不走指纹名）：
+    /// A 的 LIST/SIZE 快、B 的慢 → A 在 B 的 hop 期间完成。定名若只查
+    /// inflight + dirList 快照，B 会原名 STOR 覆盖 A 刚传好的不同内容文件。
+    static func testCompletedSiblingBlindSpot() {
+        print("· 已完成兄弟项定名盲区")
+        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-sibling-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let subA = baseDir.appendingPathComponent("A"); let subB = baseDir.appendingPathComponent("B")
+        try? FileManager.default.createDirectory(at: subA, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: subB, withIntermediateDirectories: true)
+        let fa = subA.appendingPathComponent("同名.mp4"); let fb = subB.appendingPathComponent("同名.mp4")
+        try? Data(repeating: 0xAA, count: 16).write(to: fa)
+        try? Data(repeating: 0xBB, count: 16).write(to: fb) // 不同内容 → 覆盖即丢数据
+        let caps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
+                                mkdir: false, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+        let movies = FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true)
+
+        // 1) 主路径：B 的 LIST hop 期间 A 完成
+        do {
+            let engine = InlineEngine()
+            engine.dirEntries = [movies] // 远端无同名 → 无 clash → 原名定名
+            engine.listDelays = [0.02, 0.5]
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("q1"),
+                                     concurrency: 2, resumeOnStart: true)
+            queue.addUploads([fa, fb])
+            waitUntil("两项都完成") { queue.snapshot().filter { $0.phase == .completed }.count == 2 }
+            assertEqual(engine.uploadCalls.count, 2, "两项都上传")
+            let p0 = engine.uploadCalls[0].remotePath.lowercased()
+            let p1 = engine.uploadCalls[1].remotePath.lowercased()
+            assertTrue(p0 != p1, "hop 期间完成的兄弟项占名必须可见：不得原名 STOR 覆盖其不同内容文件")
+            queue.suspendForShutdown()
+        }
+
+        // 2) 降级路径（LIST 全失败 → SIZE hop）：B 的 SIZE hop 期间 A 完成
+        do {
+            let engine = InlineEngine()
+            engine.failAllLists = true
+            engine.sizeDelays = [0.02, 0.5]
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("q2"),
+                                     concurrency: 2, resumeOnStart: true)
+            queue.addUploads([fa, fb])
+            waitUntil("两项降级完成") { queue.snapshot().filter { $0.phase == .completed }.count == 2 }
+            assertEqual(engine.uploadCalls.count, 2, "降级两项都上传")
+            let p0 = engine.uploadCalls[0].remotePath.lowercased()
+            let p1 = engine.uploadCalls[1].remotePath.lowercased()
+            assertTrue(p0 != p1, "降级定名同样要查已完成兄弟项占名")
+            queue.suspendForShutdown()
+        }
     }
 }

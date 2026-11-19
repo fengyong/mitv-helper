@@ -547,8 +547,8 @@ final class QueueService {
             return
         }
         // 降级路径同样要查 inflight：两项同名都降级时，SIZE 探测都返回 nil（盘上还没有），
-        // 不查重就会并发 STOR 同一目标互相毁掉
-        let unique = NameCodec.capped(NameCodec.uniqued(finalName, existing: inflightUploadNames(dir: dir, excluding: id),
+        // 不查重就会并发 STOR 同一目标互相毁掉；已完成兄弟项的占名同样要查（hop 期间完成者不可见）
+        let unique = NameCodec.capped(NameCodec.uniqued(finalName, existing: occupiedUploadNames(dir: dir, excluding: id),
                                        caseInsensitive: true)).name
         items[idx].remoteDir = dir
         items[idx].remotePath = dir == "/" ? "/" + unique : dir + "/" + unique
@@ -579,6 +579,17 @@ final class QueueService {
         })
     }
 
+    /// 定名时的已占用名 = inflight 占位 + 已完成兄弟项的实际占名。
+    /// 兄弟项在异步 hop（LIST/SIZE/指纹）期间完成时 inflight 看不见它、dirList 快照也旧：
+    /// 无 clash 路径用原名 → 会 STOR 覆盖兄弟项刚传好的不同内容文件
+    private func occupiedUploadNames(dir: String, excluding id: String) -> Set<String> {
+        inflightUploadNames(dir: dir, excluding: id).union(items.compactMap { other -> String? in
+            guard other.id != id, other.direction == .upload, other.phase == .completed,
+                  other.remoteDir == dir, let p = other.remotePath else { return nil }
+            return (p as NSString).lastPathComponent
+        })
+    }
+
     /// 同一本地文件被重复拖入：已有【已完成】的同文件同目录项 → 直接收敛为跳过，
     /// 不再传一份副本（未完成项不收敛——它可能失败，顺延改名更安全）
     private func completedDuplicatePath(localPath: String, dir: String, excluding id: String) -> String? {
@@ -600,7 +611,7 @@ final class QueueService {
         }
         // inflight 必须在此刻现算：clash 判定经过指纹/远端前缀多次异步 hop，
         // finalize 时的快照里看不见 hop 期间其他项的占位 → 会并发 STOR 同一远端名
-        let allNames = SmartRouting.existingNames(entries: dirList).union(inflightUploadNames(dir: dir, excluding: id))
+        let allNames = SmartRouting.existingNames(entries: dirList).union(occupiedUploadNames(dir: dir, excluding: id))
         // 顺延后缀可能把名字推过 NAME_MAX → 定名后再按 GBK 字节截断
         let unique = NameCodec.capped(NameCodec.uniqued(remoteName, existing: allNames, caseInsensitive: true)).name
         items[idx].remoteDir = dir
