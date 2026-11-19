@@ -43,6 +43,8 @@ final class TVBrowserView: NSView {
     private let collection = NSCollectionView()
     private let scroll = NSScrollView()
     private let actionBar = GlassActionBar()
+    /// 「上传到这里」：以当前浏览目录为批级目标入队（设计稿 v2 §5.3；常驻右下角，与居中的操作条不重叠）
+    private let uploadHereButton = CapsuleButton("上传到这里", style: .secondary)
 
     private var keyMonitor: Any?
 
@@ -124,6 +126,10 @@ final class TVBrowserView: NSView {
         actionBar.onDelete = { [weak self] in self?.deleteSelected() }
         actionBar.onClose = { [weak self] in self?.clearSelection() }
 
+        uploadHereButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(uploadHereButton)
+        uploadHereButton.tapAction = { [weak self] in self?.uploadHereTapped() }
+
         NSLayoutConstraint.activate([
             effect.topAnchor.constraint(equalTo: topAnchor),
             effect.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -156,7 +162,15 @@ final class TVBrowserView: NSView {
 
             actionBar.centerXAnchor.constraint(equalTo: centerXAnchor),
             actionBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -14),
+
+            uploadHereButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            uploadHereButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -14),
         ])
+    }
+
+    /// 浏览到哪、传到哪：当前浏览目录 = 本批文件的落点（不改全局存放位置，设计稿 v2 §5.3）
+    private func uploadHereTapped() {
+        coordinator.uploadHere(at: path)
     }
 
     // MARK: 数据

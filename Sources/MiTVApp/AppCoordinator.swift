@@ -781,6 +781,19 @@ final class AppCoordinator: NSObject {
 
     // MARK: - 浏览态下载
 
+    /// 浏览页「上传到这里」（设计稿 v2 §5.3）：以当前浏览目录为批级目标入队，**不修改**全局存放位置。
+    /// D5：首版不接照片图库入口——组合路径「chip 设指定 + 主页从照片图库挑选」已覆盖能力
+    func uploadHere(at dir: String) {
+        picks.chooseMedia(on: window) { [weak self] media, ignored in
+            guard let self = self else { return }
+            if ignored > 0 { self.showToast("已忽略 \(ignored) 个不支持的项目") }
+            guard !media.isEmpty else { return }
+            self.queue.addUploads(media, targetDir: dir)
+            self.setMode(.home)
+            self.showToast("\(media.count) 个文件即将存到 \(self.targetDisplayPath(dir))")
+        }
+    }
+
     func downloadEntries(_ entries: [FTPFileEntry], completion: ((Bool) -> Void)? = nil) {
         guard !entries.isEmpty else { completion?(false); return }
         picks.chooseFolder(on: window) { [weak self] dir in
