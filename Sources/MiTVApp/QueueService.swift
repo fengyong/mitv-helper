@@ -310,7 +310,11 @@ final class QueueService {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
         guard items[idx].phase == .connecting else { return } // 可能已被暂停/取消
         guard case .success(let root) = rootEntries else {
-            finishWithEngineError(id: id, error: rootEntries.failureError ?? EngineError.connectionFailed("无法读取电视文件列表"))
+            // 根列表读不到（新盘挂载怪癖/空目录 LIST 报错/偶发失败）→ 降级直传根目录。
+            // 无目录列表 = 无重名判定（覆盖风险让位于可用性）；上传本身失败再如实报错
+            let reason = (rootEntries.failureError as? LocalizedError)?.errorDescription ?? "未知"
+            FileHandle.standardError.write(Data("[queue] list / 失败（\(reason)）→ 降级直传根目录\n".utf8))
+            startUploadWithFallback(id, dir: "/", handle: handle)
             return
         }
         let dir = SmartRouting.destinationDir(kind: items[idx].kind, rootEntries: root)
@@ -335,8 +339,10 @@ final class QueueService {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
         guard items[idx].phase == .connecting else { return }
         guard case .success(let dirList) = dirEntries else {
-            // 目标目录读不到就不盲传——宁可失败也不覆盖
-            finishWithEngineError(id: id, error: dirEntries.failureError ?? EngineError.connectionFailed("无法读取目标文件夹"))
+            // 目标目录在第一跳确认存在，但列不出内容（空目录 LIST 报错的服务器怪癖）→ 降级直传该目录
+            let reason = (dirEntries.failureError as? LocalizedError)?.errorDescription ?? "未知"
+            FileHandle.standardError.write(Data("[queue] list \(dir) 失败（\(reason)）→ 降级直传该目录\n".utf8))
+            startUploadWithFallback(id, dir: dir, handle: handle)
             return
         }
         // 并发互斥：其他未终结上传项已占用的远端名也计入（各项回调在 stateQ 串行处理，无竞态）
@@ -438,6 +444,17 @@ final class QueueService {
         }
     }
 
+    /// 列表不可得时的降级：目标定死为 dir，原名直传（无重名判定——可用性优先于覆盖保护）
+    private func startUploadWithFallback(_ id: String, dir: String, handle: TransferHandle) {
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        guard items[idx].phase == .connecting else { return }
+        let mapped = NameCodec.remoteName(for: items[idx].displayName)
+        items[idx].remoteDir = dir
+        items[idx].remotePath = dir == "/" ? "/" + mapped.remote : dir + "/" + mapped.remote
+        items[idx].needsNameMapping = mapped.needsMapping
+        startUpload(id, handle: handle)
+    }
+
     /// 相同文件：不传输，直接标记完成并说明原因
     private func skipUploadAsDuplicate(_ id: String, dir: String, remotePath: String, needsMapping: Bool) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
@@ -528,7 +545,9 @@ final class QueueService {
         let before = items[idx].phase
         items[idx] = QueueStateMachine.apply(event, to: items[idx])
         if items[idx].phase != before || event.isProgress {
-            persistLocked()
+            // 终态必须立即落盘：进度事件可节流，但 complete/fail 若也被节流窗口吞掉，
+            // app 被杀后重启会从陈旧的 queue.json 恢复出错误状态
+            persistLocked(force: items[idx].phase.isTerminal)
             notifyChange()
             if event.isProgress == false { scheduleIfNeeded() }
         }

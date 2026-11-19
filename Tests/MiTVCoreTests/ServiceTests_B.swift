@@ -14,6 +14,7 @@ enum ServiceTests_B {
         testQueueServiceIntegration()
         testUploadCollision()
         testBrowseFilter()
+        testEmptyDiskFallback()
     }
 
     // MARK: - 队列状态机
@@ -233,6 +234,10 @@ enum ServiceTests_B {
         var pendingUploadCompletions: [(Result<Int64, Error>) -> Void] = []
         /// list 返回的目录内容（重名判定测试用）
         var dirEntries: [FTPFileEntry] = [FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true)]
+        /// true 时所有 list 以失败收场（空盘/列表降级测试）
+        var failAllLists = false
+        /// 指定路径的 list 以失败收场（目录存在但列不出内容的怪癖模拟）
+        var failListPath: String?
         /// downloadPrefix 返回的「远端前缀」内容（nil → 失败）
         var remotePrefix: Data?
         private var prefixCallCount = 0
@@ -262,6 +267,14 @@ enum ServiceTests_B {
         func ping(_ endpoint: FTPEndpoint, completion: @escaping (Error?) -> Void) { DispatchQueue.global().async { completion(nil) } }
         func list(_ endpoint: FTPEndpoint, path: String, completion: @escaping (Result<[FTPFileEntry], Error>) -> Void) {
             DispatchQueue.global().async {
+                if self.failAllLists {
+                    completion(.failure(EngineError.connectionFailed("模拟列表失败")))
+                    return
+                }
+                if let p = self.failListPath, p == path {
+                    completion(.failure(EngineError.connectionFailed("模拟目录列表失败")))
+                    return
+                }
                 completion(.success(self.dirEntries))
             }
         }
@@ -401,6 +414,66 @@ extension ServiceTests_B {
         assertFalse(BrowseFilter.isVisible("lost.dir"), "Android 丢失目录")
         assertFalse(BrowseFilter.isVisible("FOUND.000"), "Windows 检查点")
         assertFalse(BrowseFilter.isVisible("found.007"), "检查点编号系列")
+    }
+}
+
+// MARK: - 空盘/列表失败降级（新 U 盘没有任何目录 → 允许直传根目录）
+
+extension ServiceTests_B {
+
+    static func testEmptyDiskFallback() {
+        print("· 空盘/列表失败降级")
+        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-emptydisk-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let caps = Capabilities(utf8Filenames: false, appeResume: false, restResume: false,
+                                mkdir: false, deleteFile: true, rename: true, mlsd: false, sizeCommand: false)
+        let f1 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-empty-\(UUID().uuidString).mp4")
+        try! Data(repeating: 0xCD, count: 1024).write(to: f1)
+        defer { try? FileManager.default.removeItem(at: f1) }
+        let fname = f1.lastPathComponent
+        let moviesDir = FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true)
+
+        func makeQueue(_ dir: String, _ engine: InlineEngine) -> QueueService {
+            QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                         capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent(dir),
+                         concurrency: 1, resumeOnStart: true)
+        }
+
+        // 1) 根列表读不到（全新空盘 LIST 报错）→ 降级直传根目录，不再判死
+        do {
+            let engine = InlineEngine()
+            engine.failAllLists = true
+            let queue = makeQueue("rootfail", engine)
+            queue.addUploads([f1])
+            waitUntil("根列表失败 → 降级直传根目录") { queue.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.count, 1, "降级后仍发起上传")
+            assertEqual(engine.uploadCalls.first?.remotePath, "/" + fname, "落到根目录原名")
+            let it = queue.snapshot().first!
+            assertEqual(it.remoteDir, "/", "卡片显示电视根目录")
+            assertTrue(it.failureReason == nil, "无失败原因")
+        }
+
+        // 2) 根正常、目标目录列不出内容（空 Movies LIST 报错怪癖）→ 降级直传 /Movies
+        do {
+            let engine = InlineEngine()
+            engine.dirEntries = [moviesDir]
+            engine.failListPath = "/Movies"
+            let queue = makeQueue("dirfail", engine)
+            queue.addUploads([f1])
+            waitUntil("目标目录列表失败 → 降级直传该目录") { queue.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.count, 1, "降级后仍发起上传")
+            assertEqual(engine.uploadCalls.first?.remotePath, "/Movies/" + fname, "落到已确认存在的目标目录")
+        }
+
+        // 3) 全新空盘正常路径回归：根列表成功且为空 → 无同名 → 直传根目录
+        do {
+            let engine = InlineEngine()
+            engine.dirEntries = []
+            let queue = makeQueue("cleanempty", engine)
+            queue.addUploads([f1])
+            waitUntil("空盘正常直传根目录") { queue.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, "/" + fname, "空根 → 原名直传")
+        }
     }
 }
 
