@@ -447,9 +447,8 @@ final class TVBrowserView: NSView {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
                     guard let self = self else { return }
                     let records = self.coordinator.trashStore.records
-                    guard !records.isEmpty else { NSLog("MITV-SMOKE inplace-undo: no records"); return }
+                    guard !records.isEmpty else { return }
                     self.coordinator.files.restore(records, progress: { _, _, _ in }) { restored, failed in
-                        NSLog("MITV-SMOKE inplace-undo restored=%d failed=%d", restored, failed)
                         self.clearSelection()
                         self.reload()
                     }
@@ -464,11 +463,9 @@ final class TVBrowserView: NSView {
             guard let self = self else { return }
             let records = self.coordinator.trashStore.records
             guard !records.isEmpty else {
-                NSLog("MITV-SMOKE undo: no records")
                 return
             }
             self.files.restore(records, progress: { _, _, _ in }) { restored, failed in
-                NSLog("MITV-SMOKE undo restored=%d failed=%d", restored, failed)
                 self.enterTrashRefreshIfInTrash()
             }
         }
