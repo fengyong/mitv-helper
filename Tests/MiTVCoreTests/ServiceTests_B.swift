@@ -16,6 +16,7 @@ enum ServiceTests_B {
         testBrowseFilter()
         testEmptyDiskFallback()
         testAutoMakeDir()
+        testThumbCacheStore()
     }
 
     // MARK: - 队列状态机
@@ -412,6 +413,47 @@ extension ServiceTests_B {
         assertFalse(BrowseFilter.isVisible("lost.dir"), "Android 丢失目录")
         assertFalse(BrowseFilter.isVisible("FOUND.000"), "Windows 检查点")
         assertFalse(BrowseFilter.isVisible("found.007"), "检查点编号系列")
+    }
+}
+
+// MARK: - 缩略图磁盘缓存索引（SQLite）
+
+extension ServiceTests_B {
+
+    static func testThumbCacheStore() {
+        print("· 缩略图磁盘缓存索引")
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-thumbdb-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ThumbCacheStore(directory: dir)
+        store.store(path: "/Pictures/a.jpg", size: 1024, digest: "aaaa1111", file: "h1.jpg")
+        assertEqual(store.lookup(path: "/Pictures/a.jpg", size: 1024), "h1.jpg", "path+size 命中")
+
+        // size 变化（内容已变）→ miss
+        assertTrue(store.lookup(path: "/Pictures/a.jpg", size: 2048) == nil, "size 变化视为 miss")
+
+        // 覆盖更新：同 path 新 size → 新文件名
+        store.store(path: "/Pictures/a.jpg", size: 2048, digest: nil, file: "h2.jpg")
+        assertEqual(store.lookup(path: "/Pictures/a.jpg", size: 2048), "h2.jpg", "覆盖更新")
+        assertTrue(store.lookup(path: "/Pictures/a.jpg", size: 1024) == nil, "旧记录被替换")
+
+        // 重启（新实例）→ 仍命中（SQLite 持久化）
+        let store2 = ThumbCacheStore(directory: dir)
+        assertEqual(store2.lookup(path: "/Pictures/a.jpg", size: 2048), "h2.jpg", "重启后仍命中")
+
+        // 删除
+        store2.delete(path: "/Pictures/a.jpg")
+        assertTrue(store2.lookup(path: "/Pictures/a.jpg", size: 2048) == nil, "删除后 miss")
+
+        // 超限剪枝：上限 10，插 16 条 → 剩 ≤10（按 created_at 删最旧）
+        let small = ThumbCacheStore(directory: dir.appendingPathComponent("small"), maxEntries: 10)
+        for i in 1...16 {
+            small.store(path: "/p/\(i).jpg", size: Int64(i), digest: nil, file: "f\(i).jpg")
+        }
+        let left = small.count
+        assertTrue(left <= 10, "超限剪枝到上限内（实际 \(left)）")
+        assertTrue(small.lookup(path: "/p/1.jpg", size: 1) == nil, "最旧的被剪掉")
+        assertTrue(small.lookup(path: "/p/16.jpg", size: 16) != nil, "最新的保留")
     }
 }
 

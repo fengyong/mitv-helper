@@ -295,6 +295,8 @@ final class TVFileService {
     private var failedThumbs = Set<String>()
     private let fetchLock = NSLock()
     private let maxThumbBytes: Int64 = 20 * 1024 * 1024
+    /// SQLite 磁盘索引 + 缩略图文件落盘：重启后浏览不再重复下载（用户需求）
+    private lazy var thumbStore = ThumbCacheStore(directory: thumbDir)
 
     private var thumbDir: URL {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -321,6 +323,18 @@ final class TVFileService {
             completion(cached)
             return
         }
+        // SQLite 磁盘命中（path+size）：重启后免重复下载；缩略图文件丢失则删记录走重新生成
+        let cachedFile = thumbStore.lookup(path: entry.path, size: entry.size ?? -1)
+        if let file = cachedFile {
+            let thumbURL = thumbDir.appendingPathComponent(file)
+            if let image = NSImage(contentsOf: thumbURL) {
+                thumbCache.setObject(image, forKey: key)
+                completion(image)
+                return
+            }
+            thumbStore.delete(path: entry.path)
+            try? FileManager.default.removeItem(at: thumbURL)
+        }
         // 负缓存：失败一次本会话内不再重试（防每次浏览都重下大图）
         fetchLock.lock()
         if failedThumbs.contains(entry.path) || fetchingPaths.contains(entry.path) {
@@ -332,17 +346,31 @@ final class TVFileService {
         fetchLock.unlock()
 
         // 缓存文件名用路径哈希：中文长路径的 percent-encoding 可超 NAME_MAX=255 导致永不落盘（review D7）
+        // orig- 前缀：原图/前缀临时文件——与缩略图持久文件（md5.jpg）区分，防 finish 收尾误删缩略图
         let ext = (entry.name as NSString).pathExtension
         let hashed = FileDigest.md5Hex(Data(entry.path.utf8)) + (ext.isEmpty ? "" : "." + ext)
-        let localURL = thumbDir.appendingPathComponent(hashed)
+        let localURL = thumbDir.appendingPathComponent("orig-" + hashed)
         guard let endpoint = endpointProvider() else {
             markNotFetching(entry.path); completion(nil); return
+        }
+        // 生成成功：缩略图 JPEG 落盘 + 记录入 SQLite（digest=原文件/前缀文件的 md5，供内容寻址扩展）
+        let localSize = entry.size ?? 0
+        let persist: (NSImage) -> Void = { [weak self] img in
+            guard let self = self else { return }
+            let thumbFile = FileDigest.md5Hex(Data(entry.path.utf8)) + ".jpg"
+            if let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+               let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) {
+                try? jpeg.write(to: self.thumbDir.appendingPathComponent(thumbFile))
+                let digest = FileDigest.fingerprint(url: localURL, fileSize: min(localSize, FileDigest.prefixLimit))?.hex
+                self.thumbStore.store(path: entry.path, size: entry.size ?? localSize, digest: digest, file: thumbFile)
+            }
         }
         let finish: (NSImage?) -> Void = { [weak self] img in
             guard let self = self else { return }
             self.markNotFetching(entry.path)
             if let img = img {
                 self.thumbCache.setObject(img, forKey: key)
+                persist(img)
             } else {
                 self.fetchLock.lock()
                 self.failedThumbs.insert(entry.path)
@@ -369,19 +397,12 @@ final class TVFileService {
         engineProvider().download(endpoint, remotePath: entry.path, to: localURL,
                                   handle: nil, onProgress: nil) { [weak self] result in
             guard let self = self else { return }
-            self.markNotFetching(entry.path)
-            if case .success = result, let image = NSImage(contentsOf: localURL) {
-                let thumb = image.scaled(maxPixel: 400) ?? image
-                self.thumbCache.setObject(thumb, forKey: key)
-                try? FileManager.default.removeItem(at: localURL)
-                DispatchQueue.main.async { completion(thumb) }
-            } else {
-                self.fetchLock.lock()
-                self.failedThumbs.insert(entry.path)
-                self.fetchLock.unlock()
-                try? FileManager.default.removeItem(at: localURL)
-                DispatchQueue.main.async { completion(nil) }
+            // 统一走 finish：落盘 + 入 SQLite（此前图片分支旧内联尾部绕过 finish → 永不入库）
+            guard case .success = result, let image = NSImage(contentsOf: localURL) else {
+                finish(nil)
+                return
             }
+            finish(image.scaled(maxPixel: 400) ?? image)
         }
     }
 
