@@ -24,6 +24,8 @@ enum ServiceTests_B {
         testBatchRetryRearm()
         testCompletedSiblingBlindSpot()
         testThumbFetchSafety()
+        testUploadTargetPersistence()
+        testQueueItemDirOverrideRoundTrip()
     }
 
     // MARK: - 队列状态机
@@ -1232,6 +1234,71 @@ extension ServiceTests_B {
         assertEqual(third.ok, 2, "第三次回调：两项全部成功")
         assertEqual(third.bad, 0, "bad==0 才会触发续删")
         queue.suspendForShutdown()
+    }
+}
+
+// MARK: - 存放位置持久化（设计稿 docs/20261119_design_upload_target.md v2 §7）
+
+extension ServiceTests_B {
+
+    static func testUploadTargetPersistence() {
+        print("· 存放位置持久化（customUploadDir / recentUploadDirs）")
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-target-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = TVStore(directory: dir)
+        assertTrue(store.state.customUploadDir == nil, "初始无指定位置（智能分类）")
+        store.setUploadTarget("/电视剧/庆余年2")
+        store.recordRecentUploadDir("/电视剧/庆余年2")
+        store.recordRecentUploadDir("/电影")
+        store.recordRecentUploadDir("/电视剧/庆余年2")
+
+        // 新实例（模拟重启）读回
+        let store2 = TVStore(directory: dir)
+        assertEqual(store2.state.customUploadDir, "/电视剧/庆余年2", "customUploadDir round-trip")
+        assertEqual(store2.state.recentUploadDirs, ["/电视剧/庆余年2", "/电影"], "recentUploadDirs 去重且最新在前")
+
+        // 恢复智能分类：目标清空，最近记录保留
+        store.setUploadTarget(nil)
+        let store3 = TVStore(directory: dir)
+        assertTrue(store3.state.customUploadDir == nil, "恢复智能分类后落盘为 nil")
+        assertEqual(store3.state.recentUploadDirs, ["/电视剧/庆余年2", "/电影"], "恢复分类不清最近记录")
+
+        // pushRecentDir 纯逻辑：上限 5、去重、最新在前
+        var list: [String]? = nil
+        for i in 1...7 { list = TVStore.pushRecentDir(list, "/目录\(i)") }
+        assertEqual(list?.count, 5, "最近目录上限 5")
+        assertEqual(list?.first, "/目录7", "最新在前")
+        assertEqual(list?.last, "/目录3", "最旧的被截断")
+        assertEqual(TVStore.pushRecentDir(["/a", "/b"], "/a"), ["/a", "/b"], "重复推入 → 移到最前不堆积")
+
+        // 旧版本 tv.json（无新字段）→ 解码 nil，无感升级（边界场景 #9）
+        let legacyJSON = "{\"endpoint\":{\"host\":\"1.2.3.4\",\"port\":2121},\"onboardingDone\":true}".data(using: .utf8)!
+        try! legacyJSON.write(to: dir.appendingPathComponent("tv.json"))
+        let store4 = TVStore(directory: dir)
+        assertTrue(store4.state.customUploadDir == nil, "旧 JSON 缺 customUploadDir → nil")
+        assertTrue(store4.state.recentUploadDirs == nil, "旧 JSON 缺 recentUploadDirs → nil")
+        assertEqual(store4.endpoint?.host, "1.2.3.4", "旧 JSON 其余字段照常读回")
+    }
+
+    static func testQueueItemDirOverrideRoundTrip() {
+        print("· 队列项批级目标 dirOverride round-trip")
+        var it = QueueItem(direction: .upload, kind: .video, localPath: "/tmp/a.mp4",
+                           displayName: "a.mp4", sizeBytes: 100)
+        assertTrue(it.dirOverride == nil, "默认无批级目标（跟随全局存放位置/智能分流）")
+        it.dirOverride = "/剧集/庆余年2"
+
+        let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+        let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
+        let back = (try! dec.decode([QueueItem].self, from: try! enc.encode([it]))).first!
+        assertEqual(back.dirOverride, "/剧集/庆余年2", "dirOverride 随 queue.json 持久化（重启恢复不丢批级目标）")
+
+        // 旧版本队列 JSON（无 dirOverride 字段）→ nil
+        let legacy = ("[{\"id\":\"x\",\"direction\":\"upload\",\"kind\":\"video\",\"localPath\":\"/tmp/a.mp4\","
+            + "\"displayName\":\"a.mp4\",\"sizeBytes\":100,\"phase\":\"queued\",\"bytes\":0,\"bytesPerSecond\":0,"
+            + "\"needsNameMapping\":false,\"batchId\":\"b\",\"addedAt\":\"2026-11-19T00:00:00Z\",\"autoPaused\":false}]").data(using: .utf8)!
+        let old = (try! dec.decode([QueueItem].self, from: legacy)).first!
+        assertTrue(old.dirOverride == nil, "旧 JSON 缺 dirOverride → nil")
     }
 }
 
