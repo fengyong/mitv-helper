@@ -6,6 +6,12 @@ import Foundation
 // 最近使用快切（上限 5）+ 新建文件夹（仅 caps.mkdir=true 显示，D1：真机 MKD 550 隐藏，不摆必失败按钮）。
 // 数据源复用 TVFileService.list（目录优先排序）+ BrowseFilter（隐藏系统目录）。零术语。
 
+/// 翻转坐标的竖排 stack：作为 scroll.documentView 时短内容也锚定可视区顶部
+/// （非翻转 documentView 内容沉底，走查实测发现）
+private final class FlippedStackView: NSStackView {
+    override var isFlipped: Bool { true }
+}
+
 final class DirPickerController: NSObject, NSWindowDelegate {
 
     /// 确认回调：nil = 智能分类；非 nil = 指定目录（可为 "/" 根目录）
@@ -30,7 +36,7 @@ final class DirPickerController: NSObject, NSWindowDelegate {
     private let backButton: NSButton
     private let breadcrumb: NSStackView
     private let scroll = NSScrollView()
-    private let dirListStack = NSStackView()
+    private let dirListStack = FlippedStackView()
     private let emptyLabel: NSTextField
     private let spinner = NSProgressIndicator()
     private let recentTitle = UIUtil.label("最近使用", size: 11, color: .tertiaryLabelColor)
@@ -57,7 +63,7 @@ final class DirPickerController: NSObject, NSWindowDelegate {
     // MARK: 呈现
 
     func present(asSheetOf parent: NSWindow) {
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 600),
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 640),
                            styleMask: [.titled, .closable, .fullSizeContentView],
                            backing: .buffered, defer: false)
         win.title = "选择存放位置"
@@ -120,6 +126,9 @@ final class DirPickerController: NSObject, NSWindowDelegate {
         dirListStack.orientation = .vertical
         dirListStack.alignment = .leading
         dirListStack.spacing = 2
+        // 作为 scroll.documentView：必须交给 Auto Layout（钉顶/左/右、高度随内容伸展），
+        // 否则 autoresizing frame 与 contentView 约束打架，列表整块不渲染（走查实测发现）
+        dirListStack.translatesAutoresizingMaskIntoConstraints = false
 
         scroll.hasVerticalScroller = true
         scroll.drawsBackground = false
@@ -151,19 +160,19 @@ final class DirPickerController: NSObject, NSWindowDelegate {
 
         let browserSection = NSView()
         browserSection.translatesAutoresizingMaskIntoConstraints = false
+        // 无固有尺寸的普通 view 交给 NSStackView 排布会被压缩：显式定高 + 强 hugging
+        //（内链高度 = 最近 16+6+chips 26 + 12+面包屑 18 + 6+列表 220 + 12+底行 26 = 342）
+        browserSection.heightAnchor.constraint(equalToConstant: 342).isActive = true
+        browserSection.setContentHuggingPriority(.required, for: .vertical)
+        browserSection.setContentCompressionResistancePriority(.required, for: .vertical)
 
-        let buttonsRow = NSStackView(views: [currentLabel, NSView(), cancelButton, confirmButton])
-        buttonsRow.orientation = .horizontal
-        buttonsRow.spacing = 10
-        buttonsRow.alignment = .centerY
-        buttonsRow.translatesAutoresizingMaskIntoConstraints = false
-
+        // 取消/确认也排在 section 底行（此前 buttonsRow 与 currentLabel 跨分支双重挂载，
+        // 把底行布局搅乱——走查实测发现）
         let content = NSStackView(views: [
             UIUtil.label("选择存放位置", size: 18, weight: .semibold),
             smartRadio, smartHint,
             customRadio, customHint,
             browserSection,
-            buttonsRow,
         ])
         content.orientation = .vertical
         content.alignment = .leading
@@ -173,15 +182,15 @@ final class DirPickerController: NSObject, NSWindowDelegate {
             content.setCustomSpacing(16, after: titleView)
         }
         content.setCustomSpacing(18, after: customHint)
-        content.setCustomSpacing(18, after: browserSection)
         content.translatesAutoresizingMaskIntoConstraints = false
 
         let root = UIUtil.visualEffect(material: .windowBackground, blending: .withinWindow)
         root.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(content)
 
-        // 浏览区内部（手排：面包屑 + 列表 + 底行）
-        let sectionViews = [recentTitle, recentRow, backButton, breadcrumb, scroll, emptyLabel, spinner, newFolderButton]
+        // 浏览区内部（手排：面包屑 + 列表 + 底行[新建文件夹 · 当前所在 · 取消 · 使用此位置]）
+        let sectionViews = [recentTitle, recentRow, backButton, breadcrumb, scroll, emptyLabel, spinner,
+                            newFolderButton, currentLabel, cancelButton, confirmButton]
         for v in sectionViews {
             v.translatesAutoresizingMaskIntoConstraints = false
             browserSection.addSubview(v)
@@ -213,7 +222,7 @@ final class DirPickerController: NSObject, NSWindowDelegate {
             scroll.topAnchor.constraint(equalTo: breadcrumb.bottomAnchor, constant: 6),
             scroll.leadingAnchor.constraint(equalTo: browserSection.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: browserSection.trailingAnchor),
-            scroll.heightAnchor.constraint(equalToConstant: 250),
+            scroll.heightAnchor.constraint(equalToConstant: 220),
 
             emptyLabel.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
             emptyLabel.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
@@ -223,11 +232,15 @@ final class DirPickerController: NSObject, NSWindowDelegate {
             newFolderButton.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 12),
             newFolderButton.leadingAnchor.constraint(equalTo: browserSection.leadingAnchor),
             newFolderButton.bottomAnchor.constraint(equalTo: browserSection.bottomAnchor),
+
             currentLabel.centerYAnchor.constraint(equalTo: newFolderButton.centerYAnchor),
             currentLabel.leadingAnchor.constraint(equalTo: newFolderButton.trailingAnchor, constant: 12),
+            currentLabel.trailingAnchor.constraint(lessThanOrEqualTo: cancelButton.leadingAnchor, constant: -12),
 
-            buttonsRow.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            buttonsRow.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            confirmButton.centerYAnchor.constraint(equalTo: newFolderButton.centerYAnchor),
+            confirmButton.trailingAnchor.constraint(equalTo: browserSection.trailingAnchor),
+            cancelButton.centerYAnchor.constraint(equalTo: newFolderButton.centerYAnchor),
+            cancelButton.trailingAnchor.constraint(equalTo: confirmButton.leadingAnchor, constant: -10),
         ])
 
         // 手排布局下 smartHint/customHint 需要换行宽度
@@ -254,9 +267,12 @@ final class DirPickerController: NSObject, NSWindowDelegate {
 
     private func applyModeVisibility() {
         let custom = customRadio.state == .on
-        for v in [recentTitle, recentRow, backButton, breadcrumb, scroll, newFolderButton] {
+        for v in [recentTitle, recentRow, backButton, breadcrumb, scroll] {
             v.isHidden = !custom
         }
+        // 新建文件夹可见性 = 指定模式 且 caps.mkdir（D1）；不放进上面的模式列表——
+        // 模式切换不得越权改写能力门控（走查实测发现：mkdir=false 也被顶成可见）
+        newFolderButton.isHidden = !custom || coordinator.store.capabilities?.mkdir != true
         spinner.isHidden = !custom
         if custom {
             emptyLabel.isHidden = !dirs.isEmpty
