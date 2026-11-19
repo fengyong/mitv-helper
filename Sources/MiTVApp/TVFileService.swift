@@ -62,7 +62,9 @@ final class TVFileService {
     }
 
     /// 批量直删。progress(done, total, name) 主队列；completion 返回成功数与失败名单。
+    /// tolerateMissing：远端已不存在视为删除成功（重启补删时，上次已删掉的项不应再算失败）
     func deleteEntries(_ entries: [FTPFileEntry],
+                       tolerateMissing: Bool = false,
                        progress: @escaping (_ done: Int, _ total: Int, _ name: String) -> Void,
                        completion: @escaping (Result<DeleteOutcome, Error>) -> Void) {
         let files = entries.filter { !$0.isDirectory }
@@ -88,7 +90,13 @@ final class TVFileService {
             let entry = files[i]
             progress(i, total, entry.name)
             engine.delete(endpoint, remotePath: entry.path) { error in
-                if error == nil { deleted += 1 } else { failedNames.append(entry.name) }
+                if error == nil {
+                    deleted += 1
+                } else if tolerateMissing, let e = error as? EngineError, case .remoteNotFound = e {
+                    deleted += 1
+                } else {
+                    failedNames.append(entry.name)
+                }
                 progress(i + 1, total, entry.name)
                 step(i + 1)
             }

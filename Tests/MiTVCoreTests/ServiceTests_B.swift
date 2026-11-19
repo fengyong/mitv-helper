@@ -21,6 +21,7 @@ enum ServiceTests_B {
         testPauseAllCancelsHandles()
         testBatchNameCollisions()
         testStaleInflightRace()
+        testBatchRetryRearm()
         testThumbFetchSafety()
     }
 
@@ -224,6 +225,8 @@ enum ServiceTests_B {
         private(set) var deleteCalls: [String] = []
         /// 指定路径的 delete 以失败收场（清空回收站部分失败测试用）
         var failDeletePaths: Set<String> = []
+        /// 指定路径的 delete 报 remoteNotFound（重启补删 tolerateMissing 测试用）
+        var notFoundDeletePaths: Set<String> = []
         private(set) var uploadHandles: [TransferHandle?] = []
         private(set) var downloadHandles: [TransferHandle?] = []
         /// true 时 upload 完成回调被扣住，供测试精确控制时序；false 时延迟自动成功/失败
@@ -324,8 +327,12 @@ enum ServiceTests_B {
             lock.lock()
             deleteCalls.append(remotePath)
             let fail = failDeletePaths.contains(remotePath)
+            let notFound = notFoundDeletePaths.contains(remotePath)
             lock.unlock()
-            DispatchQueue.global().async { completion(fail ? EngineError.permissionDenied("模拟删除失败") : nil) }
+            DispatchQueue.global().async {
+                if notFound { completion(EngineError.remoteNotFound(remotePath)) }
+                else { completion(fail ? EngineError.permissionDenied("模拟删除失败") : nil) }
+            }
         }
         func move(_ endpoint: FTPEndpoint, from: String, to: String, completion: @escaping (Error?) -> Void) {
             lock.lock(); moveCalls.append(MoveCall(from: from, to: to)); lock.unlock()
@@ -950,6 +957,29 @@ extension ServiceTests_B {
             if case .notConnected? = box.error as? EngineError {} else { assertTrue(false, "未连接 → notConnected 错误") }
             assertEqual(engine.deleteCalls.count, 0, "未连接不发起 DELE")
         }
+
+        // 6) tolerateMissing：远端已不存在视为删成功（重启补删幂等）；默认仍如实报失败
+        do {
+            let engine = InlineEngine()
+            engine.notFoundDeletePaths = ["/Movies/a.mp4"]
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a, b], tolerateMissing: true, progress: { _, _, _ in }) { box.set($0) }
+            waitMain("补删完成") { box.done }
+            assertEqual(box.outcome?.deletedCount, 2, "notFound 计入删除成功（上次已删掉的项不再算失败）")
+            assertEqual(box.outcome?.failedNames.count, 0, "补删无失败名单")
+
+            let engine2 = InlineEngine()
+            engine2.notFoundDeletePaths = ["/Movies/a.mp4"]
+            let service2 = TVFileService(engineProvider: { engine2 }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                         capabilitiesProvider: { caps })
+            let box2 = DeleteBox()
+            service2.deleteEntries([a, b], progress: { _, _, _ in }) { box2.set($0) }
+            waitMain("默认模式返回") { box2.done }
+            assertEqual(box2.outcome?.deletedCount, 1, "默认不容忍 notFound")
+            assertEqual(box2.outcome?.failedNames, ["a.mp4"], "默认模式 notFound 如实报失败")
+        }
     }
 }
 
@@ -1117,6 +1147,56 @@ extension ServiceTests_B {
         let p0 = engine.uploadCalls[0].remotePath.lowercased()
         let p1 = engine.uploadCalls[1].remotePath.lowercased()
         assertTrue(p0 != p1, "异步 hop 后定名必须现算 inflight：两项不得并发 STOR 同一远端路径")
+        queue.suspendForShutdown()
+    }
+}
+
+// MARK: - 批次完成回调必须在重试后重新武装（「删除前先下载」续删依赖它）
+
+extension ServiceTests_B {
+
+    /// 整批失败 → 回调一次；重试一项成功（另一项仍失败）→ 批次再次全终态，回调必须再发；
+    /// 全部重试成功 → 回调第三次且 bad==0（这是续删的触发点）。
+    /// 若 batchNotified 不随重试移除，后两次回调丢失 → 取回成功后删除永远不会执行。
+    static func testBatchRetryRearm() {
+        print("· 批次完成回调重试后重新武装")
+        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-rearm-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let dlDir = baseDir.appendingPathComponent("dl")
+        try? FileManager.default.createDirectory(at: dlDir, withIntermediateDirectories: true)
+        let caps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
+                                mkdir: false, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+        let engine = InlineEngine()
+        engine.hangDownloads = true
+        let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                 capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("q"),
+                                 concurrency: 2, resumeOnStart: true)
+        let lock = NSLock()
+        var fires: [(ok: Int, bad: Int)] = []
+        queue.onBatchCompleted = { _, ok, bad in lock.lock(); fires.append((ok, bad)); lock.unlock() }
+        func fireCount() -> Int { lock.lock(); defer { lock.unlock() }; return fires.count }
+
+        let items = queue.addDownloads([
+            FTPFileEntry(path: "/a/x.mp4", name: "x.mp4", isDirectory: false, size: 1),
+            FTPFileEntry(path: "/a/y.mp4", name: "y.mp4", isDirectory: false, size: 1),
+        ], toDirectory: dlDir)
+        assertEqual(items.count, 2, "两项都入队")
+        waitUntil("两项起传") { queue.snapshot().filter { $0.phase == .running }.count == 2 }
+        engine.releaseAllDownloads(.failure(EngineError.connectionFailed("模拟断线")))
+        waitMain("整批失败 → 首次完成回调") { fireCount() == 1 }
+
+        engine.hangDownloads = false
+        queue.retry(id: items[0].id)
+        waitMain("重试一项成功 → 回调重新武装并再发") { fireCount() == 2 }
+        lock.lock(); let second = fires.count > 1 ? fires[1] : (ok: -1, bad: -1); lock.unlock()
+        assertEqual(second.ok, 1, "第二次回调：一项成功")
+        assertEqual(second.bad, 1, "第二次回调：一项仍失败")
+
+        queue.retry(id: items[1].id)
+        waitMain("全部重试成功 → 第三次回调") { fireCount() == 3 }
+        lock.lock(); let third = fires.count > 2 ? fires[2] : (ok: -1, bad: -1); lock.unlock()
+        assertEqual(third.ok, 2, "第三次回调：两项全部成功")
+        assertEqual(third.bad, 0, "bad==0 才会触发续删")
         queue.suspendForShutdown()
     }
 }

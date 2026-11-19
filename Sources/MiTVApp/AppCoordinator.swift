@@ -55,6 +55,8 @@ final class AppCoordinator: NSObject {
     private var settingsController: SettingsController?
     /// 「删除前先下载」的批次登记：batchId → (待删文件, 完成回调)。整批取回成功后才执行删除
     private var pendingDeleteBatches: [String: (files: [FTPFileEntry], after: () -> Void)] = [:]
+    /// 正在执行删除的批次（防止重连补删与完成回调重复触发同一批删除）
+    private var deletingBatches: Set<String> = []
     /// 未连接时拖入的文件：先记下，连上后自动入队（旧实现直接丢弃，用户白拖一趟）
     private var pendingDropURLs: [URL] = []
 
@@ -418,6 +420,7 @@ final class AppCoordinator: NSObject {
                     self.pendingDropURLs = []
                     self.enqueueFileURLs(urls)
                 }
+                self.catchUpPendingDeletes()
                 completion?(true, nil)
             case .failure(let error):
                 self.heartbeatStatus = .off
@@ -505,13 +508,13 @@ final class AppCoordinator: NSObject {
     }
 
     private func handleBatchCompleted(batchId: String, ok: Int, bad: Int) {
-        // 「删除前先下载」的批次：整批取回成功才执行删除，失败则中止（数据安全兜底）
-        if let pending = pendingDeleteBatches.removeValue(forKey: batchId) {
-            savePendingDeletes()
+        // 「删除前先下载」的批次：整批取回成功才执行删除；有失败则保留登记，
+        // 重试取回成功后完成回调会再次触发（QueueService 重试时重新武装批次通知）
+        if let pending = pendingDeleteBatches[batchId] {
             if bad == 0 {
-                deleteRemote(pending.files, after: pending.after)
+                runPendingDelete(batchId: batchId, tolerateMissing: false)
             } else {
-                showToast("取回没有全部成功，已取消删除 · 可重试取回后再删")
+                showToast("取回没有全部成功，已暂停删除 · 重试取回成功后会自动继续删除")
                 pending.after()
             }
             return
@@ -641,15 +644,17 @@ final class AppCoordinator: NSObject {
         deleteRemote(filesToDelete, after: after)
     }
 
-    private func deleteRemote(_ filesToDelete: [FTPFileEntry], after: @escaping () -> Void) {
+    private func deleteRemote(_ filesToDelete: [FTPFileEntry], tolerateMissing: Bool = false,
+                              after: @escaping () -> Void, onFullyDeleted: (() -> Void)? = nil) {
         let total = filesToDelete.count
         showToast("正在移除 \(total) 项…")
-        files.deleteEntries(filesToDelete, progress: { _, _, _ in }) { [weak self] result in
+        files.deleteEntries(filesToDelete, tolerateMissing: tolerateMissing, progress: { _, _, _ in }) { [weak self] result in
             guard let self = self else { return }
             switch result {
             case .success(let outcome):
                 if outcome.failedNames.isEmpty {
                     self.showToast("已永久删除 \(outcome.deletedCount) 项")
+                    onFullyDeleted?()
                 } else if outcome.deletedCount > 0 {
                     self.showToast("已永久删除 \(outcome.deletedCount) 项 · \(outcome.failedNames.count) 项没有成功")
                 } else {
@@ -659,6 +664,36 @@ final class AppCoordinator: NSObject {
                 self.showToast("删除没有完成：\(error.localizedDescription)")
             }
             after()
+        }
+    }
+
+    /// 执行「删除前先下载」的删除。登记保留到全部删成功才移除：
+    /// 删除中途进程被杀，重启后凭登记补删（已删掉的项 tolerateMissing 容忍）
+    private func runPendingDelete(batchId: String, tolerateMissing: Bool) {
+        guard let pending = pendingDeleteBatches[batchId], !deletingBatches.contains(batchId) else { return }
+        deletingBatches.insert(batchId)
+        deleteRemote(pending.files, tolerateMissing: tolerateMissing, after: { [weak self] in
+            guard let self = self else { return }
+            self.deletingBatches.remove(batchId)
+            if self.pendingDeleteBatches[batchId] != nil {
+                self.showToast("还有文件没有删掉 · 下次连接电视后会自动重试")
+            }
+            pending.after()
+        }, onFullyDeleted: { [weak self] in
+            guard let self = self else { return }
+            self.pendingDeleteBatches.removeValue(forKey: batchId)
+            self.savePendingDeletes()
+        })
+    }
+
+    /// 连接成功后补删：重启前已整批取回成功的批次，重启后不会再触发 onBatchCompleted
+    /// （全终态批次的完成通知在 init 时已预置），必须在这里主动续删，否则删除意图永久丢失
+    private func catchUpPendingDeletes() {
+        let snapshot = queue.snapshot()
+        for batchId in Array(pendingDeleteBatches.keys) {
+            let members = snapshot.filter { $0.batchId == batchId }
+            guard !members.isEmpty, members.allSatisfy({ $0.phase == .completed }) else { continue }
+            runPendingDelete(batchId: batchId, tolerateMissing: true)
         }
     }
 

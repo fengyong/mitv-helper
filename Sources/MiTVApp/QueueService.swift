@@ -283,6 +283,11 @@ final class QueueService {
             let before = items[idx].phase
             items[idx] = QueueStateMachine.apply(event, to: items[idx])
             if items[idx].phase != before {
+                if before.isTerminal && !items[idx].phase.isTerminal {
+                    // 重试把批次拉回非终态后必须重新武装完成回调，
+                    // 否则「删除前先下载」的批次重试成功后不会再触发删除
+                    batchNotified.remove(items[idx].batchId)
+                }
                 if cancelHandle { handles[id]?.cancel() }
                 persistLocked(force: true)
                 notifyChange()
