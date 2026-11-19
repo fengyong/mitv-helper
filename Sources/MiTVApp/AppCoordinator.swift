@@ -190,6 +190,11 @@ final class AppCoordinator: NSObject {
             (EngineHolder.shared.engine() as? MockEngine)?.failNextPingCount = 3
         }
         guard let auto = env["MITV_AUTO"] else { return }
+        if auto == "picker" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.openPhotoPicker()
+            }
+        }
         if auto == "settings" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 self?.openSettings()

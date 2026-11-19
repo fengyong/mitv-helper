@@ -15,6 +15,7 @@ enum ServiceTests_B {
         testUploadCollision()
         testBrowseFilter()
         testEmptyDiskFallback()
+        testAutoMakeDir()
     }
 
     // MARK: - 队列状态机
@@ -116,21 +117,10 @@ enum ServiceTests_B {
         func entry(_ path: String, _ name: String, dir: Bool) -> FTPFileEntry {
             FTPFileEntry(path: path, name: name, isDirectory: dir)
         }
-        let rootWithBoth = [entry("/", "Movies", dir: true), entry("/", "Pictures", dir: true)]
-        let rootNone: [FTPFileEntry] = [entry("/", "DCIM", dir: true)]
-        let rootOnlyPictures = [entry("/", "Pictures", dir: true)]
-
-        // 实测矩阵主分支
-        assertEqual(SmartRouting.destinationDir(kind: .video, rootEntries: rootWithBoth), "/Movies", "视频→Movies")
-        assertEqual(SmartRouting.destinationDir(kind: .image, rootEntries: rootWithBoth), "/Pictures", "图片→Pictures")
-        assertEqual(SmartRouting.destinationDir(kind: .other, rootEntries: rootWithBoth), "/", "其他→根")
-        // 目录缺失回退：不混放，直接根目录
-        assertEqual(SmartRouting.destinationDir(kind: .video, rootEntries: rootNone), "/", "Movies 缺失视频→根")
-        assertEqual(SmartRouting.destinationDir(kind: .image, rootEntries: rootNone), "/", "Pictures 缺失图片→根")
-        assertEqual(SmartRouting.destinationDir(kind: .video, rootEntries: rootOnlyPictures), "/", "只有 Pictures 时视频→根")
-        // 大小写不敏感
-        let lower = [entry("/", "movies", dir: true)]
-        assertEqual(SmartRouting.destinationDir(kind: .video, rootEntries: lower), "/Movies", "movies 小写也命中")
+        // 2026-11-19 定案：目标恒定（目录不存在由 QueueService 尽力 MKD；被拒回根）
+        assertEqual(SmartRouting.destinationDir(kind: .video), "/Movies", "视频恒定→Movies")
+        assertEqual(SmartRouting.destinationDir(kind: .image), "/Pictures", "图片恒定→Pictures")
+        assertEqual(SmartRouting.destinationDir(kind: .other), "/", "其他→根")
 
         // GBK 兼容映射 + 重名顺延
         let existing: Set<String> = ["周岁.mp4", "a.mp4"]
@@ -238,6 +228,8 @@ enum ServiceTests_B {
         var failAllLists = false
         /// 指定路径的 list 以失败收场（目录存在但列不出内容的怪癖模拟）
         var failListPath: String?
+        /// MKD 是否成功（真机 SwiFTP 550 → false）
+        var allowMKD = false
         /// downloadPrefix 返回的「远端前缀」内容（nil → 失败）
         var remotePrefix: Data?
         private var prefixCallCount = 0
@@ -300,7 +292,9 @@ enum ServiceTests_B {
         }
         func delete(_ endpoint: FTPEndpoint, remotePath: String, completion: @escaping (Error?) -> Void) { DispatchQueue.global().async { completion(nil) } }
         func move(_ endpoint: FTPEndpoint, from: String, to: String, completion: @escaping (Error?) -> Void) { DispatchQueue.global().async { completion(nil) } }
-        func makeDirectory(_ endpoint: FTPEndpoint, path: String, completion: @escaping (Error?) -> Void) { DispatchQueue.global().async { completion(EngineError.unsupported("MKD")) } }
+        func makeDirectory(_ endpoint: FTPEndpoint, path: String, completion: @escaping (Error?) -> Void) {
+            DispatchQueue.global().async { completion(self.allowMKD ? nil : EngineError.unsupported("MKD")) }
+        }
         func size(_ endpoint: FTPEndpoint, remotePath: String, completion: @escaping (Result<Int64?, Error>) -> Void) { DispatchQueue.global().async { completion(.success(nil)) } }
         func probeCapabilities(_ endpoint: FTPEndpoint, completion: @escaping (Result<Capabilities, Error>) -> Void) {
             DispatchQueue.global().async { completion(.success(Capabilities())) }
@@ -417,6 +411,52 @@ extension ServiceTests_B {
     }
 }
 
+// MARK: - 目标目录自动创建（无目录尽力 MKD；被拒回根）
+
+extension ServiceTests_B {
+
+    static func testAutoMakeDir() {
+        print("· 目标目录自动创建")
+        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-mkdir-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let caps = Capabilities(utf8Filenames: false, appeResume: false, restResume: false,
+                                mkdir: true, deleteFile: true, rename: true, mlsd: false, sizeCommand: false)
+        let f1 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-mkd-\(UUID().uuidString).mp4")
+        try! Data(repeating: 0xE1, count: 512).write(to: f1)
+        defer { try? FileManager.default.removeItem(at: f1) }
+        let fname = f1.lastPathComponent
+
+        func makeQueue(_ dir: String, _ engine: InlineEngine) -> QueueService {
+            QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                         capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent(dir),
+                         concurrency: 1, resumeOnStart: true)
+        }
+
+        // 1) 无目录 + MKD 成功 → list 新目录（空）→ 直传 /Movies
+        do {
+            let engine = InlineEngine()
+            engine.dirEntries = []        // 根列表：无任何目录
+            engine.allowMKD = true
+            let queue = makeQueue("mkdok", engine)
+            queue.addUploads([f1])
+            waitUntil("无目录 + MKD 成功 → 直传 /Movies") { queue.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, "/Movies/" + fname, "自动建目录后归入 Movies")
+        }
+
+        // 2) 无目录 + MKD 被拒（真机 550）→ 回退根目录
+        do {
+            let engine = InlineEngine()
+            engine.dirEntries = []
+            engine.allowMKD = false
+            engine.failListPath = "/Movies" // MKD 拒后 LIST /Movies 也 550
+            let queue = makeQueue("mkddeny", engine)
+            queue.addUploads([f1])
+            waitUntil("MKD 被拒 → 回根目录") { queue.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, "/" + fname, "MKD 拒 → 根目录原名")
+        }
+    }
+}
+
 // MARK: - 空盘/列表失败降级（新 U 盘没有任何目录 → 允许直传根目录）
 
 extension ServiceTests_B {
@@ -465,14 +505,16 @@ extension ServiceTests_B {
             assertEqual(engine.uploadCalls.first?.remotePath, "/Movies/" + fname, "落到已确认存在的目标目录")
         }
 
-        // 3) 全新空盘正常路径回归：根列表成功且为空 → 无同名 → 直传根目录
+        // 3) 全新空盘（无任何目录 + MKD 被拒，真机 550 语义）→ 回根直传
         do {
             let engine = InlineEngine()
             engine.dirEntries = []
+            engine.allowMKD = false
+            engine.failListPath = "/Movies" // MKD 拒 → 目录不存在 → LIST 也 550
             let queue = makeQueue("cleanempty", engine)
             queue.addUploads([f1])
-            waitUntil("空盘正常直传根目录") { queue.snapshot().first?.phase == .completed }
-            assertEqual(engine.uploadCalls.first?.remotePath, "/" + fname, "空根 → 原名直传")
+            waitUntil("空盘 MKD 被拒 → 回根直传") { queue.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, "/" + fname, "MKD 拒 → 根目录原名")
         }
     }
 }

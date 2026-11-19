@@ -7,6 +7,9 @@ import CoreServices
 
 final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSCollectionViewDelegateFlowLayout, NSWindowDelegate {
 
+    /// 来源页签：最近（相机胶卷倒序）/ 视频（只看视频）/ 相册（照片 App 的相册与文件夹）
+    private enum PickerMode: Int { case recent = 0, videos = 1, albums = 2 }
+
     private var window: NSWindow?
     private var onDone: ([URL]) -> Void
     private var onClose: (() -> Void)
@@ -16,6 +19,15 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
     private var anchorIndex: Int?
     private var exporting = false
 
+    // 相册导航
+    private var mode: PickerMode = .recent
+    /// 当前相册/文件夹列表（相册页签的集合层级内容）
+    private var collections: [PHCollection] = []
+    /// true = 网格显示集合列表（相册/文件夹）；false = 显示资产
+    private var showingCollections = false
+    /// 相册导航栈（push 相册/文件夹；顶层为空）
+    private var albumStack: [PHCollection] = []
+
     private let collection = NSCollectionView()
     private let scroll = NSScrollView()
     private let bar = GlassActionBar()
@@ -24,6 +36,13 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
     private let authButton = CapsuleButton("允许访问照片", style: .primary)
     private let authHint = UIUtil.label("需要先允许访问照片图库，才能挑选要发送的照片和视频", size: 13, color: .secondaryLabelColor, align: .center)
     private var authorizedAccess = false
+
+    // 顶部来源页签 + 相册面包屑
+    private var sourceButtons: [CapsuleButton] = []
+    private let backButton = NSButton(image: Icons.chevronLeft, target: nil, action: nil)
+    private let crumbLabel = UIUtil.label("", size: 13, weight: .medium)
+    /// crumb 左缘约束随返回按钮显隐更新（不能 init 一次性求值）
+    private var crumbLeading: NSLayoutConstraint!
 
     init(onDone: @escaping ([URL]) -> Void, onClose: @escaping () -> Void) {
         self.onDone = onDone
@@ -69,6 +88,37 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
         collection.delegate = self
         collection.isSelectable = true
         collection.register(PhotoCell.self, forItemWithIdentifier: NSUserInterfaceItemIdentifier("PhotoCell"))
+        collection.register(AlbumCell.self, forItemWithIdentifier: NSUserInterfaceItemIdentifier("AlbumCell"))
+
+        // 来源页签：最近 / 视频 / 相册
+        let sourceBar = NSStackView()
+        sourceBar.orientation = .horizontal
+        sourceBar.spacing = 8
+        sourceBar.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(sourceBar)
+        let tabs: [(String, PickerMode)] = [("最近", .recent), ("视频", .videos), ("相册", .albums)]
+        for (title, m) in tabs {
+            let b = CapsuleButton(title, style: m == .recent ? .primary : .secondary)
+            b.tag = m.rawValue
+            b.tapAction = { [weak self] in self?.switchMode(m) }
+            sourceBar.addArrangedSubview(b)
+            sourceButtons.append(b)
+        }
+
+        // 相册导航（相册页签进入集合后才可见）
+        backButton.isBordered = false
+        backButton.imagePosition = .imageOnly
+        backButton.contentTintColor = .secondaryLabelColor
+        backButton.target = self
+        backButton.action = #selector(goBackAlbum)
+        backButton.translatesAutoresizingMaskIntoConstraints = false
+        backButton.isHidden = true
+        root.addSubview(backButton)
+        crumbLabel.textColor = .secondaryLabelColor
+        crumbLabel.translatesAutoresizingMaskIntoConstraints = false
+        crumbLabel.isHidden = true
+        root.addSubview(crumbLabel)
+        crumbLeading = crumbLabel.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14)
 
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = collection
@@ -89,15 +139,27 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
         root.addSubview(emptyLabel)
 
         NSLayoutConstraint.activate([
-            scroll.topAnchor.constraint(equalTo: root.topAnchor, constant: 8),
+            sourceBar.topAnchor.constraint(equalTo: root.topAnchor, constant: 10),
+            sourceBar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+
+            backButton.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            backButton.centerYAnchor.constraint(equalTo: crumbLabel.centerYAnchor),
+            backButton.widthAnchor.constraint(equalToConstant: 24),
+            backButton.heightAnchor.constraint(equalToConstant: 24),
+
+            crumbLeading,
+            crumbLabel.centerYAnchor.constraint(equalTo: sourceBar.centerYAnchor),
+            crumbLabel.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor, constant: -14),
+
+            scroll.topAnchor.constraint(equalTo: sourceBar.bottomAnchor, constant: 8),
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor),
 
-            spinner.topAnchor.constraint(equalTo: root.topAnchor, constant: 40),
+            spinner.topAnchor.constraint(equalTo: root.topAnchor, constant: 56),
             spinner.centerXAnchor.constraint(equalTo: root.centerXAnchor),
 
-            authHint.topAnchor.constraint(equalTo: root.topAnchor, constant: 60),
+            authHint.topAnchor.constraint(equalTo: root.topAnchor, constant: 76),
             authHint.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             authButton.topAnchor.constraint(equalTo: authHint.bottomAnchor, constant: 16),
             authButton.centerXAnchor.constraint(equalTo: root.centerXAnchor),
@@ -138,7 +200,7 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
                     self.authorizedAccess = true
                     self.authHint.isHidden = true
                     self.authButton.isHidden = true
-                    self.loadCameraRoll()
+                    self.applyMode(self.mode)
                 } else {
                     self.authorizedAccess = false
                     self.authHint.isHidden = false
@@ -150,24 +212,160 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
         }
     }
 
-    private func loadCameraRoll() {
+    // MARK: 来源页签与相册导航
+
+    private func switchMode(_ m: PickerMode) {
+        guard m != mode else { return }
+        mode = m
+        albumStack.removeAll()
+        collections.removeAll()
+        for b in sourceButtons {
+            b.style = (b.tag == m.rawValue) ? .primary : .secondary
+        }
+        applyMode(m)
+    }
+
+    /// 按当前模式加载数据并刷新网格
+    private func applyMode(_ m: PickerMode) {
         spinner.startAnimation(nil)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let options = PHFetchOptions()
-            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)] // 按日期倒序
-            var fetched: PHFetchResult<PHAsset>?
-            let cameraRoll = PHAssetCollection.fetchAssetCollections(with: .smartAlbum, subtype: .smartAlbumUserLibrary, options: nil)
-            if let cam = cameraRoll.firstObject {
-                fetched = PHAsset.fetchAssets(in: cam, options: options)
+            switch m {
+            case .recent:
+                let options = PHFetchOptions()
+                options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+                var fetched: PHFetchResult<PHAsset>?
+                let cameraRoll = PHAssetCollection.fetchAssetCollections(with: .smartAlbum, subtype: .smartAlbumUserLibrary, options: nil)
+                if let cam = cameraRoll.firstObject {
+                    fetched = PHAsset.fetchAssets(in: cam, options: options)
+                }
+                if fetched == nil || fetched!.count == 0 {
+                    fetched = PHAsset.fetchAssets(with: options)
+                }
+                DispatchQueue.main.async { self?.setAssets(fetched, crumb: nil) }
+            case .videos:
+                let options = PHFetchOptions()
+                options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+                let fetched = PHAsset.fetchAssets(with: .video, options: options)
+                DispatchQueue.main.async { self?.setAssets(fetched, crumb: nil) }
+            case .albums:
+                let list = (self?.albumStack.isEmpty == true) ? Self.topLevelCollections() : self?.children(of: self!.albumStack.last!)
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.spinner.stopAnimation(nil)
+                    self.collections = list ?? []
+                    self.showingCollections = true
+                    self.assets = nil
+                    self.refreshNavChrome()
+                    self.emptyLabel.isHidden = !self.collections.isEmpty
+                    self.emptyLabel.stringValue = "还没有相册"
+                    self.collection.reloadData()
+                }
             }
-            if fetched == nil || fetched!.count == 0 {
-                fetched = PHAsset.fetchAssets(with: options)
+        }
+    }
+
+    /// 顶层：用户相册 + 文件夹 + 「个人收藏」，按名字排序
+    private static func topLevelCollections() -> [PHCollection] {
+        var out: [PHCollection] = []
+        let userAlbums = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: nil)
+        for i in 0..<userAlbums.count { out.append(userAlbums.object(at: i)) }
+        let folders = PHCollectionList.fetchCollectionLists(with: .folder, subtype: .any, options: nil)
+        for i in 0..<folders.count { out.append(folders.object(at: i)) }
+        let favorites = PHAssetCollection.fetchAssetCollections(with: .smartAlbum, subtype: .smartAlbumFavorites, options: nil)
+        for i in 0..<favorites.count { out.append(favorites.object(at: i)) }
+        return out.sorted { ($0.localizedTitle ?? "") < ($1.localizedTitle ?? "") }
+    }
+
+    /// 文件夹的直接子项（相册/子文件夹）
+    private func children(of list: PHCollection) -> [PHCollection] {
+        guard let folder = list as? PHCollectionList else { return [] }
+        let children = PHCollectionList.fetchCollections(in: folder, options: nil)
+        var out: [PHCollection] = []
+        for i in 0..<children.count { out.append(children.object(at: i)) }
+        return out.sorted { ($0.localizedTitle ?? "") < ($1.localizedTitle ?? "") }
+    }
+
+    private func setAssets(_ fetched: PHFetchResult<PHAsset>?, crumb: String?) {
+        spinner.stopAnimation(nil)
+        assets = fetched
+        showingCollections = false
+        anchorIndex = nil // 资产列表切换后旧下标失效（防 ⇧ 范围选错乱）
+        refreshNavChrome(crumb: crumb)
+        emptyLabel.isHidden = (fetched?.count ?? 0) > 0
+        emptyLabel.stringValue = "这个相册是空的"
+        collection.reloadData()
+    }
+
+    private func refreshNavChrome(crumb: String? = nil) {
+        let inAlbumNav = mode == .albums
+        backButton.isHidden = !inAlbumNav || albumStack.isEmpty
+        crumbLabel.isHidden = !inAlbumNav
+        crumbLeading.constant = backButton.isHidden ? 14 : 8
+        if let c = crumb {
+            crumbLabel.stringValue = c
+        } else if let top = albumStack.last {
+            crumbLabel.stringValue = top.localizedTitle ?? ""
+        } else {
+            crumbLabel.stringValue = ""
+        }
+    }
+
+    /// 点相册/文件夹：文件夹下钻，相册显示资产
+    func albumTapped(at index: Int) {
+        guard index < collections.count else { return }
+        let tapped = collections[index]
+        if let assetCollection = tapped as? PHAssetCollection {
+            albumStack.append(assetCollection)
+            spinner.startAnimation(nil)
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let options = PHFetchOptions()
+                options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+                let fetched = PHAsset.fetchAssets(in: assetCollection, options: options)
+                DispatchQueue.main.async { self?.setAssets(fetched, crumb: assetCollection.localizedTitle) }
+            }
+        } else if let folder = tapped as? PHCollectionList {
+            albumStack.append(folder)
+            spinner.startAnimation(nil)
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let sub = self?.children(of: folder) ?? []
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.spinner.stopAnimation(nil)
+                    self.collections = sub
+                    self.showingCollections = true
+                    self.assets = nil
+                    self.refreshNavChrome(crumb: folder.localizedTitle)
+                    self.emptyLabel.isHidden = !sub.isEmpty
+                    self.emptyLabel.stringValue = "这个文件夹是空的"
+                    self.collection.reloadData()
+                }
+            }
+        }
+    }
+
+    @objc private func goBackAlbum() {
+        guard mode == .albums, !albumStack.isEmpty else { return }
+        albumStack.removeLast()
+        spinner.startAnimation(nil)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let list: [PHCollection]
+            let crumb: String?
+            if let top = self.albumStack.last {
+                list = self.children(of: top)
+                crumb = top.localizedTitle
+            } else {
+                list = Self.topLevelCollections()
+                crumb = ""
             }
             DispatchQueue.main.async {
-                guard let self = self else { return }
                 self.spinner.stopAnimation(nil)
-                self.assets = fetched
-                self.emptyLabel.isHidden = (fetched?.count ?? 0) > 0
+                self.collections = list
+                self.showingCollections = true
+                self.assets = nil
+                self.refreshNavChrome(crumb: crumb)
+                self.emptyLabel.isHidden = !list.isEmpty
+                self.emptyLabel.stringValue = "这个文件夹是空的"
                 self.collection.reloadData()
             }
         }
@@ -211,13 +409,11 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
     // MARK: 导出原图 → StagingStore
 
     private func exportSelected() {
-        guard !exporting, let assets = assets else { return }
+        guard !exporting, !selected.isEmpty else { return }
         exporting = true
-        var ids: [String] = []
-        for i in 0..<assets.count {
-            let a = assets.object(at: i)
-            if selected.contains(a.localIdentifier) { ids.append(a.localIdentifier) }
-        }
+        // 直接按 localIdentifier 集合导出（exportOne 内部再 fetch 单个资产）：
+        // 用户可跨页签/相册勾选，不受当前显示列表限制
+        let ids: [String] = Array(selected)
         guard !ids.isEmpty else { exporting = false; return }
         let stagedRoot = StagingStore()
         var urls: [URL] = []
@@ -303,12 +499,20 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
     // MARK: - 数据源
 
     func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int {
-        assets?.count ?? 0
+        showingCollections ? collections.count : (assets?.count ?? 0)
     }
 
     func collectionView(_ collectionView: NSCollectionView, itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
-        let cell = collectionView.makeItem(withIdentifier: NSUserInterfaceItemIdentifier("PhotoCell"), for: indexPath) as! PhotoCell
         let index = indexPath.item
+        if showingCollections {
+            let cell = collectionView.makeItem(withIdentifier: NSUserInterfaceItemIdentifier("AlbumCell"), for: indexPath) as! AlbumCell
+            guard index < collections.count else { return cell }
+            let c = collections[index]
+            let isFolder = !(c is PHAssetCollection)
+            cell.configure(title: c.localizedTitle ?? "未命名", isFolder: isFolder, index: index, controller: self)
+            return cell
+        }
+        let cell = collectionView.makeItem(withIdentifier: NSUserInterfaceItemIdentifier("PhotoCell"), for: indexPath) as! PhotoCell
         guard let assets = assets, index < assets.count else { return cell }
         let asset = assets.object(at: index)
         cell.configure(asset: asset, index: index, controller: self)
@@ -322,6 +526,62 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
 
     fileprivate func cellTapped(index: Int, shift: Bool) {
         toggle(at: index, shift: shift)
+    }
+
+    fileprivate func albumCellTapped(index: Int) {
+        albumTapped(at: index)
+    }
+}
+
+// MARK: - 相册/文件夹格（相册页签的集合列表用）
+
+final class AlbumCell: NSCollectionViewItem {
+
+    private var index = 0
+    private weak var controller: PhotoPickerController?
+    private let iconView = NSImageView()
+    private let titleLabel = UIUtil.label("", size: 12, align: .center)
+
+    override func loadView() {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 120, height: 108))
+        view = container
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 8
+
+        iconView.wantsLayer = true
+        iconView.layer?.cornerRadius = 8
+        iconView.imageScaling = .scaleProportionallyDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(iconView)
+
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(titleLabel)
+
+        NSLayoutConstraint.activate([
+            iconView.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
+            iconView.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 64),
+            iconView.heightAnchor.constraint(equalToConstant: 56),
+
+            titleLabel.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 6),
+            titleLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 2),
+            titleLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -2),
+            titleLabel.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -4),
+        ])
+        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .inVisibleRect, .activeInKeyWindow], owner: self, userInfo: nil)
+        container.addTrackingArea(tracking)
+    }
+
+    func configure(title: String, isFolder: Bool, index: Int, controller: PhotoPickerController) {
+        self.index = index
+        self.controller = controller
+        titleLabel.stringValue = title
+        iconView.image = isFolder ? Icons.folder : Icons.photo
+        iconView.contentTintColor = NSColor.systemTeal.withAlphaComponent(0.75)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        controller?.albumCellTapped(index: index)
     }
 }
 

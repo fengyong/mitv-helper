@@ -317,9 +317,9 @@ final class QueueService {
             startUploadWithFallback(id, dir: "/", handle: handle)
             return
         }
-        let dir = SmartRouting.destinationDir(kind: items[idx].kind, rootEntries: root)
+        let dir = SmartRouting.destinationDir(kind: items[idx].kind)
         if dir == "/" {
-            finalizeUploadRouting(id, dir: dir, dirEntries: rootEntries, handle: handle)
+            finalizeUploadRouting(id, dir: dir, dirExisted: true, dirEntries: rootEntries, handle: handle)
             return
         }
         guard let endpoint = endpointProvider() else {
@@ -327,22 +327,49 @@ final class QueueService {
             return
         }
         // 重名顺延必须依据【目标目录】里的已有文件——只看根目录会让 /Movies 里的同名文件被静默覆盖
-        engineProvider().list(endpoint, path: dir) { [weak self] dirResult in
+        let dirName = (dir as NSString).lastPathComponent
+        let dirExisted = root.contains { $0.isDirectory && $0.name.lowercased() == dirName.lowercased() }
+        if dirExisted {
+            engineProvider().list(endpoint, path: dir) { [weak self] dirResult in
+                guard let self = self else { return }
+                self.stateQ.async { self.finalizeUploadRouting(id, dir: dir, dirExisted: true, dirEntries: dirResult, handle: handle) }
+            }
+            return
+        }
+        // 目录不存在 → 尽力创建（视频/图片两个目录）：支持 MKD 的设备自动归类；
+        // MKD 被拒（真机 SwiFTP 550）→ list 也失败 → 回根目录降级
+        engineProvider().makeDirectory(endpoint, path: dir) { [weak self] _ in
             guard let self = self else { return }
-            self.stateQ.async { self.finalizeUploadRouting(id, dir: dir, dirEntries: dirResult, handle: handle) }
+            self.stateQ.async {
+                guard let idx2 = self.items.firstIndex(where: { $0.id == id }),
+                      self.items[idx2].phase == .connecting,
+                      let endpoint2 = self.endpointProvider() else {
+                    self.finishWithEngineError(id: id, error: EngineError.notConnected)
+                    return
+                }
+                self.engineProvider().list(endpoint2, path: dir) { dirResult in
+                    self.stateQ.async { self.finalizeUploadRouting(id, dir: dir, dirExisted: false, dirEntries: dirResult, handle: handle) }
+                }
+            }
         }
     }
 
     /// 智能分流第二步：目标目录列表 → 净化命名 / 同名判定（相同文件跳过，不同文件加 MD5 后缀）→ 起传
-    private func finalizeUploadRouting(_ id: String, dir: String,
+    private func finalizeUploadRouting(_ id: String, dir: String, dirExisted: Bool,
                                        dirEntries: Result<[FTPFileEntry], Error>, handle: TransferHandle) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
         guard items[idx].phase == .connecting else { return }
         guard case .success(let dirList) = dirEntries else {
-            // 目标目录在第一跳确认存在，但列不出内容（空目录 LIST 报错的服务器怪癖）→ 降级直传该目录
             let reason = (dirEntries.failureError as? LocalizedError)?.errorDescription ?? "未知"
-            FileHandle.standardError.write(Data("[queue] list \(dir) 失败（\(reason)）→ 降级直传该目录\n".utf8))
-            startUploadWithFallback(id, dir: dir, handle: handle)
+            if dirExisted {
+                // 目录在第一跳确认存在，但列不出内容（空目录 LIST 报错的服务器怪癖）→ 降级直传该目录
+                FileHandle.standardError.write(Data("[queue] list \(dir) 失败（\(reason)）→ 降级直传该目录\n".utf8))
+                startUploadWithFallback(id, dir: dir, handle: handle)
+            } else {
+                // 目录不存在且创建失败（MKD 550 等）→ 该目录传不进去，回根目录
+                FileHandle.standardError.write(Data("[queue] \(dir) 不存在且创建失败（\(reason)）→ 回退根目录\n".utf8))
+                startUploadWithFallback(id, dir: "/", handle: handle)
+            }
             return
         }
         // 并发互斥：其他未终结上传项已占用的远端名也计入（各项回调在 stateQ 串行处理，无竞态）

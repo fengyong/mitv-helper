@@ -1,19 +1,15 @@
 import Foundation
 
 /// 智能分流（纯决策，可测试）。
-/// 实测事实（ARCHITECTURE §2）：电视端 MKD 550 不能建目录 → 目标只能用已有目录：
-/// 视频 → `Movies/`、图片 → `Pictures/`、对应目录不存在 → 根目录。
-/// 说明：视频在 Movies 缺失时不落入 Pictures（两类互不混放），直接回根目录。
+/// 产品决策（2026-11-19 定案）：视频恒定目标 /Movies、图片恒定 /Pictures、其他 → 根目录。
+/// 目录不存在时由 QueueService 尽力 MKD 创建；创建被拒（如真机 SwiFTP MKD 550）→ 回退根目录。
+/// 早期「目录缺失直接回根」的行为已废弃（会把 MKD 机会掐死，永远建不出分类目录）。
 enum SmartRouting {
 
-    /// 依据远端根目录列表决定目标目录。目录名匹配大小写不敏感。
-    static func destinationDir(kind: MediaKind, rootEntries: [FTPFileEntry]) -> String {
-        func hasDir(_ name: String) -> Bool {
-            rootEntries.contains { $0.isDirectory && $0.name.lowercased() == name.lowercased() }
-        }
+    static func destinationDir(kind: MediaKind) -> String {
         switch kind {
-        case .video: return hasDir("Movies") ? "/Movies" : "/"
-        case .image: return hasDir("Pictures") ? "/Pictures" : "/"
+        case .video: return "/Movies"
+        case .image: return "/Pictures"
         case .other: return "/"
         }
     }
