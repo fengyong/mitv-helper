@@ -38,6 +38,7 @@
 | 550/553 + "permission/denied/not allowed/forbidden" | permissionDenied |
 | 550/553 + "not found/no such/…"/读路径默认 | remoteNotFound |
 | 550/553 + 写操作默认（STOR/APPE/MKD/RNTO/RMD） | permissionDenied（如 SwiFTP MKD 550） |
+| 550/553 + DELE 无关键词 | ioError（文件可能还在；落 remoteNotFound 会被补删 tolerateMissing 误计删成功） |
 | 530/531 | authFailed |
 | 500/501/502/504 | unsupported(cmd) |
 | 421/425/426/其余 4xx | connectionFailed |
@@ -47,7 +48,7 @@
 ## 5. 已知边界 / 遗留
 
 - 探测 `utf8Filenames` 与 GBK 恒定发送的矛盾：真机 SwiFTP 上 UTF-8 试写读回**会**通过（服务器按字节透传），但电视端播放器按 GBK 显示会乱码——按契约「探测通过才切换」实现，**引擎默认恒 GBK**，故实际不受影响；该探测位由服务层自行解读。
-- 550 的 remoteNotFound vs permissionDenied 靠响应文本关键词判别，遇到非英文响应可能落入默认分支。
+- 550 的 remoteNotFound vs permissionDenied 靠响应文本关键词判别，遇到非英文响应可能落入默认分支。DELE 的默认分支为 ioError（fail-safe：补删宁可保留登记重试，不误报已删）；读路径默认仍 remoteNotFound。
 - 断点续传只覆盖单文件内偏移（SIZE+APPE）；队列级状态恢复归 UI/服务层（V1 优先级低）。
 - Makefile test 目标追加了 `$(ENGINE)`（见 commit 068bdc7 的 [CONTRACT-REQUEST]）：EngineTests_A 需要引擎纯逻辑源码参与单模块编译。
 
