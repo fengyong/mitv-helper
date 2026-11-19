@@ -21,10 +21,22 @@ final class TVBrowserView: NSView {
 
     // 视图
     private let backButton: NSButton
-    private let breadcrumb = UIUtil.label("电视", size: 13, weight: .semibold)
+    /// 面包屑 = 可点击的路径段按钮（点任意一段直接跳到该层目录）
+    private let breadcrumb: NSStackView = {
+        let s = NSStackView()
+        s.orientation = .horizontal
+        s.spacing = 4
+        s.alignment = .centerY
+        return s
+    }()
     /// 返回按钮显隐时同步更新（约束常量不能在 init 一次性求值）
     private var breadcrumbLeading: NSLayoutConstraint!
+    /// 刷新按钮跟随右侧可见按钮让位（浏览态=回收站入口，回收站态=清空按钮）
+    private var refreshToTrashChip: NSLayoutConstraint!
+    private var refreshToEmptyTrash: NSLayoutConstraint!
     private let trashChip: CapsuleButton
+    private let emptyTrashButton: CapsuleButton
+    private let refreshButton: NSButton
     private let spinner = NSProgressIndicator()
     /// 空态/错误态文案（多行居中；错误时写原因与重连指引）
     private let emptyLabel: NSTextField = {
@@ -46,6 +58,8 @@ final class TVBrowserView: NSView {
         self.files = coordinator.files
         backButton = NSButton(image: Icons.chevronLeft, target: nil, action: nil)
         trashChip = CapsuleButton("回收站", style: .secondary)
+        emptyTrashButton = CapsuleButton("清空回收站", style: .danger)
+        refreshButton = NSButton(image: Icons.retry, target: nil, action: nil)
         super.init(frame: .zero)
         setup()
     }
@@ -75,6 +89,20 @@ final class TVBrowserView: NSView {
         trashChip.tapAction = { [weak self] in self?.enterTrash() }
         trashChip.translatesAutoresizingMaskIntoConstraints = false
         addSubview(trashChip)
+
+        emptyTrashButton.tapAction = { [weak self] in self?.emptyTrashTapped() }
+        emptyTrashButton.isHidden = true
+        emptyTrashButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(emptyTrashButton)
+
+        refreshButton.isBordered = false
+        refreshButton.imagePosition = .imageOnly
+        refreshButton.contentTintColor = .secondaryLabelColor
+        refreshButton.target = self
+        refreshButton.action = #selector(refreshTapped)
+        refreshButton.toolTip = "重新读取当前目录"
+        refreshButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(refreshButton)
 
         spinner.isIndeterminate = true
         spinner.controlSize = .small
@@ -132,7 +160,14 @@ final class TVBrowserView: NSView {
             trashChip.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
             trashChip.centerYAnchor.constraint(equalTo: breadcrumb.centerYAnchor),
 
-            spinner.trailingAnchor.constraint(equalTo: trashChip.leadingAnchor, constant: -12),
+            emptyTrashButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            emptyTrashButton.centerYAnchor.constraint(equalTo: breadcrumb.centerYAnchor),
+
+            refreshButton.centerYAnchor.constraint(equalTo: breadcrumb.centerYAnchor),
+            refreshButton.widthAnchor.constraint(equalToConstant: 22),
+            refreshButton.heightAnchor.constraint(equalToConstant: 22),
+
+            spinner.trailingAnchor.constraint(equalTo: refreshButton.leadingAnchor, constant: -10),
             spinner.centerYAnchor.constraint(equalTo: breadcrumb.centerYAnchor),
 
             scroll.topAnchor.constraint(equalTo: breadcrumb.bottomAnchor, constant: 6),
@@ -146,6 +181,10 @@ final class TVBrowserView: NSView {
             actionBar.centerXAnchor.constraint(equalTo: centerXAnchor),
             actionBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -14),
         ])
+
+        refreshToTrashChip = refreshButton.trailingAnchor.constraint(equalTo: trashChip.leadingAnchor, constant: -12)
+        refreshToEmptyTrash = refreshButton.trailingAnchor.constraint(equalTo: emptyTrashButton.leadingAnchor, constant: -12)
+        refreshToTrashChip.isActive = true
     }
 
     // MARK: 数据
@@ -217,14 +256,20 @@ final class TVBrowserView: NSView {
     private func refreshChrome() {
         // 面包屑（零术语：只显示目录名）。注意顺序：先更新 backButton 显隐，再按新状态让位，
         // 否则约束读到的是旧值（等于把「一次性求值」bug 换了个地方重演）
+        breadcrumb.arrangedSubviews.forEach { $0.removeFromSuperview() }
         if isTrashMode {
-            breadcrumb.stringValue = "电视 / 回收站"
+            breadcrumb.addArrangedSubview(crumbButton("电视", target: ""))
+            breadcrumb.addArrangedSubview(crumbSeparator())
+            breadcrumb.addArrangedSubview(UIUtil.label("回收站", size: 13, weight: .semibold))
             backButton.isHidden = false
         } else {
-            let comps = path.split(separator: "/").map(String.init)
-            var text = "电视"
-            for c in comps { text += " / " + c }
-            breadcrumb.stringValue = text
+            breadcrumb.addArrangedSubview(crumbButton("电视", target: "/"))
+            var prefix = ""
+            for c in path.split(separator: "/").map(String.init) {
+                prefix += "/" + c
+                breadcrumb.addArrangedSubview(crumbSeparator())
+                breadcrumb.addArrangedSubview(crumbButton(c, target: prefix))
+            }
             backButton.isHidden = path == "/"
         }
         breadcrumbLeading.constant = backButton.isHidden ? 16 : 46
@@ -240,7 +285,58 @@ final class TVBrowserView: NSView {
         } else {
             trashChip.isHidden = true
         }
+        emptyTrashButton.isHidden = !isTrashMode || trashRecords.isEmpty
+        refreshToTrashChip.isActive = !isTrashMode
+        refreshToEmptyTrash.isActive = isTrashMode
         emptyLabel.isHidden = isTrashMode ? !trashRecords.isEmpty : !entries.isEmpty
+    }
+
+    /// 面包屑段按钮：identifier 存目标路径（"" = 退出回收站回浏览态）
+    private func crumbButton(_ title: String, target: String) -> NSButton {
+        let b = NSButton(title: title, target: self, action: #selector(crumbTapped(_:)))
+        b.isBordered = false
+        b.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        b.contentTintColor = .labelColor
+        b.identifier = NSUserInterfaceItemIdentifier(target)
+        return b
+    }
+
+    private func crumbSeparator() -> NSTextField {
+        UIUtil.label("/", size: 13, color: .tertiaryLabelColor)
+    }
+
+    @objc private func crumbTapped(_ sender: NSButton) {
+        let target = sender.identifier?.rawValue ?? ""
+        clearSelection()
+        if target.isEmpty {
+            reload() // 回收站 → 回当前浏览目录
+        } else if target != path || isTrashMode {
+            reload(path: target)
+        }
+    }
+
+    @objc private func refreshTapped() {
+        if isTrashMode { enterTrash() } else { reload() }
+    }
+
+    /// 清空回收站：不可逆操作，先弹系统确认（sheet），确认后永久删除全部记账文件
+    private func emptyTrashTapped() {
+        let count = coordinator.trashStore.count
+        guard count > 0, let window = window else { return }
+        let alert = NSAlert()
+        alert.messageText = "清空回收站？"
+        alert.informativeText = "将永久删除电视上的 \(count) 个文件（共 \(Fmt.bytes(coordinator.trashStore.totalBytes))），此操作无法撤销。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "永久删除")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self = self, response == .alertFirstButtonReturn else { return }
+            self.files.emptyTrash(progress: { _, _, _ in }) { deleted, failed in
+                if deleted > 0 { self.coordinator.showToast("已永久删除 \(deleted) 项") }
+                if failed > 0 { self.coordinator.showToast("有 \(failed) 项删除失败，仍留在回收站") }
+                self.enterTrash()
+            }
+        }
     }
 
     @objc private func goBack() {
@@ -314,6 +410,46 @@ final class TVBrowserView: NSView {
         refreshSelectionUI()
     }
 
+    // MARK: 方向键网格导航
+
+    /// 按 GridLayout 参数估算列数（左右边距 20、间距 14、最小宽 116）
+    private var gridColumns: Int {
+        let usable = collection.bounds.width - 40 + 14
+        return max(1, Int(usable / (116 + 14)))
+    }
+
+    private func moveSelection(by delta: Int, extend: Bool) {
+        let count = isTrashMode ? trashRecords.count : entries.count
+        guard count > 0 else { return }
+        let cols = gridColumns
+        var target: Int
+        if let anchor = anchorIndex {
+            target = anchor + delta
+        } else {
+            target = delta > 0 ? 0 : count - 1
+        }
+        if abs(delta) == 1 {
+            // 横向：跳过目录等不可选项
+            while target >= 0 && target < count && itemID(at: target) == nil { target += delta }
+        } else {
+            // 纵向：夹取到边界后，落点不可选时取该行最近的可选项
+            target = min(max(target, 0), count - 1)
+            if itemID(at: target) == nil {
+                let rowStart = (target / cols) * cols
+                let rowEnd = min(rowStart + cols, count)
+                var best: Int?
+                for i in rowStart..<rowEnd where itemID(at: i) != nil {
+                    if best == nil || abs(i - target) < abs(best! - target) { best = i }
+                }
+                guard let b = best else { return }
+                target = b
+            }
+        }
+        guard target >= 0, target < count, itemID(at: target) != nil else { return }
+        if extend { rangeSelect(to: target) } else { singleSelect(at: target) }
+        collection.scrollToItems(at: [IndexPath(item: target, section: 0)], scrollPosition: .nearestVerticalEdge)
+    }
+
     private func validateSelection() {
         selected = selected.intersection(Set(selectableIDs))
     }
@@ -364,7 +500,7 @@ final class TVBrowserView: NSView {
 
     func deleteSelected() {
         if isTrashMode {
-            coordinator.showToast("回收站里的项目请用「还原」取回，或在电视上清理")
+            coordinator.showToast("回收站里的项目请用「还原」取回，或用右上角「清空回收站」永久删除")
             return
         }
         let entries = selectedEntries()
@@ -376,7 +512,7 @@ final class TVBrowserView: NSView {
         }
     }
 
-    private func restoreSelected() {
+    func restoreSelected() {
         let records = selectedRecords()
         guard !records.isEmpty else { return }
         files.restore(records, progress: { _, _, _ in }) { [weak self] restored, failed in
@@ -488,6 +624,7 @@ final class TVBrowserView: NSView {
                       event.window === self.window, // 只拦本窗口的按键，别吞掉 sheet 里的 Esc
                       self.superview != nil,
                       !self.coordinator.hasModalOverlay, // 确认浮层/向导在场时不拦（review D4：⌫ 叠框/Esc 吞掉）
+                      self.window?.attachedSheet == nil, // 系统 sheet（清空确认/保存面板）在场时不拦
                       !(self.window?.firstResponder is NSTextView) else { return event }
                 let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
                 if flags == [.command], event.charactersIgnoringModifiers == "a" {
@@ -500,6 +637,13 @@ final class TVBrowserView: NSView {
                 }
                 if event.keyCode == 51, !self.selected.isEmpty { // ⌫
                     self.deleteSelected()
+                    return nil
+                }
+                // 方向键在网格里移动选择（⇧ 扩展范围）；旧实现只有 ⌘A/Esc/⌫，键盘完全无法导航
+                let cols = self.gridColumns
+                let deltas: [UInt16: Int] = [123: -1, 124: 1, 125: cols, 126: -cols]
+                if let delta = deltas[event.keyCode] {
+                    self.moveSelection(by: delta, extend: flags.contains(.shift))
                     return nil
                 }
                 return event
@@ -526,9 +670,10 @@ extension TVBrowserView: NSCollectionViewDataSource, NSCollectionViewDelegateFlo
         let index = indexPath.item
         if isTrashMode {
             let record = trashRecords[index]
-            cell.configureTrash(record: record, selected: selected.contains(record.id),
+            cell.configureTrash(record: record, selected: selected.contains(record.id), files: files,
                                 onSelect: { [weak self] in self?.toggleSelect(at: index) },
-                                onShift: { [weak self] in self?.rangeSelect(to: index) })
+                                onShift: { [weak self] in self?.rangeSelect(to: index) },
+                                onSingle: { [weak self] in self?.singleSelect(at: index) })
         } else {
             let entry = entries[index]
             cell.configure(entry: entry,
@@ -557,6 +702,9 @@ final class TVFileCell: NSCollectionViewItem {
     private var onSelect: (() -> Void)?
     private var onShift: (() -> Void)?
     private var onDouble: (() -> Void)?
+    private var onSingle: (() -> Void)?
+    private var isTrashItem = false
+    private var isDirectoryItem = false
     private var hoverCheckbox = false
 
     override func loadView() {
@@ -606,12 +754,20 @@ final class TVFileCell: NSCollectionViewItem {
     }
 
     func configure(entry: FTPFileEntry, selected: Bool, browser: TVBrowserView, files: TVFileService, index: Int) {
+        // 单元格复用：旧条目还在下载缩略图就取消（滚动的网格会复用单元格，
+        // 不取消则滚过的每张图都在后台继续下完，连接数随滚动距离线性增长）
+        if identifierKey != entry.path {
+            files.cancelThumbnail(forPath: identifierKey)
+        }
         identifierKey = entry.path
         nameLabel.stringValue = entry.name
         subLabel.stringValue = entry.isDirectory ? "文件夹" : Fmt.bytes(entry.size ?? 0)
 
         onSelect = { browser.toggleSelect(at: index) }
         onShift = { browser.rangeSelect(to: index) }
+        onSingle = { browser.singleSelect(at: index) }
+        isTrashItem = false
+        isDirectoryItem = entry.isDirectory
         onDouble = { [weak browser] in
             if entry.isDirectory { browser?.enter(entry) }
         }
@@ -642,7 +798,10 @@ final class TVFileCell: NSCollectionViewItem {
         setSelected(selected)
     }
 
-    func configureTrash(record: TrashStore.Record, selected: Bool, onSelect: @escaping () -> Void, onShift: @escaping () -> Void) {
+    func configureTrash(record: TrashStore.Record, selected: Bool, files: TVFileService, onSelect: @escaping () -> Void, onShift: @escaping () -> Void, onSingle: @escaping () -> Void) {
+        if identifierKey != record.id {
+            files.cancelThumbnail(forPath: identifierKey)
+        }
         identifierKey = record.id
         nameLabel.stringValue = record.name
         let parent = (record.originalPath as NSString).deletingLastPathComponent
@@ -651,6 +810,9 @@ final class TVFileCell: NSCollectionViewItem {
         thumbView.contentTintColor = .quaternaryLabelColor
         self.onSelect = onSelect
         self.onShift = onShift
+        self.onSingle = onSingle
+        isTrashItem = true
+        isDirectoryItem = false
         onDouble = nil
         setSelected(selected)
     }
@@ -676,6 +838,14 @@ final class TVFileCell: NSCollectionViewItem {
 
     override func mouseDown(with event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.control) {
+            // Ctrl+单击 = 右键菜单（macOS 惯例）
+            if !checkMark.isChecked { onSingle?() }
+            if let menu = menu(for: event) {
+                NSMenu.popUpContextMenu(menu, with: event, for: view)
+            }
+            return
+        }
         if flags.contains(.shift) {
             onShift?()
         } else if flags.contains(.command) {
@@ -689,16 +859,48 @@ final class TVFileCell: NSCollectionViewItem {
         if event.clickCount == 2 { onDouble?() }
     }
 
+    override func rightMouseDown(with event: NSEvent) {
+        if let menu = menu(for: event) {
+            NSMenu.popUpContextMenu(menu, with: event, for: view)
+        }
+    }
+
+    // 右键菜单：未选中先单选该项（已多选则保留多选，操作作用于整个选择）
+    // 注：NSCollectionViewItem 是 NSViewController，menu(for:) 非父类方法，不能标 override
+    func menu(for event: NSEvent) -> NSMenu? {
+        if !checkMark.isChecked { onSingle?() }
+        let menu = NSMenu()
+        let item: NSMenuItem
+        if isTrashItem {
+            item = NSMenuItem(title: "还原", action: #selector(menuRestore), keyEquivalent: "")
+        } else if isDirectoryItem {
+            item = NSMenuItem(title: "打开", action: #selector(menuOpen), keyEquivalent: "")
+        } else {
+            item = NSMenuItem(title: "删除", action: #selector(menuDelete), keyEquivalent: "")
+        }
+        item.target = self
+        menu.addItem(item)
+        return menu
+    }
+
+    @objc private func menuOpen() { onDouble?() }
+
     // 右键：删除（委托浏览器处理）
     @objc private func menuDelete() {
+        browserFromResponderChain()?.deleteSelected()
+    }
+
+    @objc private func menuRestore() {
+        browserFromResponderChain()?.restoreSelected()
+    }
+
+    private func browserFromResponderChain() -> TVBrowserView? {
         var responder: NSResponder? = view.nextResponder
         while let r = responder {
-            if let browser = r as? TVBrowserView {
-                browser.deleteSelected()
-                return
-            }
+            if let browser = r as? TVBrowserView { return browser }
             responder = r.nextResponder
         }
+        return nil
     }
 }
 

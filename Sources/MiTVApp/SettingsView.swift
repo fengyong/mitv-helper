@@ -144,6 +144,12 @@ final class SettingsController: NSObject, NSWindowDelegate {
 
     @objc private func demoChanged() {
         let mock = demoToggle.state == .on
+        // 传输中切换引擎会让在途任务与新任务分属两个引擎（状态错乱）：先拦下
+        if coordinator.hasActiveTransfers {
+            demoToggle.state = mock ? .off : .on
+            coordinator.showToast("有文件正在传输，请先完成或取消后再切换演示模式")
+            return
+        }
         EngineHolder.shared.switchTo(mock: mock)
         // 重新探测（Mock 立即成功；真实引擎交由向导处理）
         if let endpoint = coordinator.store.endpoint {

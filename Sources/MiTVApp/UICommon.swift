@@ -365,12 +365,17 @@ final class ThinProgressBar: NSView {
 
 final class ToastView: NSView {
 
+    /// 带「撤销」等动作的 toast：宿主保护它不被普通提示顶掉
+    let hasAction: Bool
     private let label = NSTextField(labelWithString: "")
     private var actionButton: NSButton?
     private var tapAction: (() -> Void)?
     private var dismissTimer: Timer?
+    /// 退场（淡出并移除）后回调，宿主用它补播排队提示
+    var onDismissed: (() -> Void)?
 
     init(text: String, actionTitle: String? = nil, action: (() -> Void)? = nil) {
+        hasAction = actionTitle != nil
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 12
@@ -433,6 +438,7 @@ final class ToastView: NSView {
             animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             self?.removeFromSuperview()
+            self?.onDismissed?()
         })
     }
 }
@@ -446,8 +452,13 @@ extension NSButton {
     }
 }
 
-/// Toast 宿主：挂在主内容区顶部层级；无按钮时点击完全穿透
+/// Toast 宿主：挂在主内容区顶部层级；无按钮时点击完全穿透。
+/// 单槽位 + 排队：带撤销的 toast 不被普通提示顶掉（否则删除后的撤销入口会被完成提示冲走），
+/// 普通提示在撤销 toast 退场后按序补播。
 final class ToastHostView: NSView {
+
+    private var queued: [ToastView] = []
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard !subviews.isEmpty else { return nil }
         let hit = super.hitTest(point)
@@ -456,16 +467,33 @@ final class ToastHostView: NSView {
     }
 
     func show(_ toast: ToastView, in bounds: NSRect) {
-        // 单条 toast：新 toast 顶掉旧的，避免叠影
+        if let current = subviews.compactMap({ $0 as? ToastView }).first,
+           current.hasAction, !toast.hasAction {
+            queued.append(toast)
+            if queued.count > 3 { queued.removeFirst() }
+            return
+        }
+        queued.removeAll() // 新 toast（尤其带撤销的）顶掉旧的，排队中的过期提示一并作废
         for sub in subviews {
+            (sub as? ToastView)?.onDismissed = nil
             sub.removeFromSuperview()
         }
+        present(toast, in: bounds)
+    }
+
+    private func present(_ toast: ToastView, in bounds: NSRect) {
         let ideal = toast.fittingSize
         toast.frame = NSRect(x: bounds.midX - ideal.width / 2,
                              y: bounds.maxY - ideal.height - 18,
                              width: max(ideal.width, 120), height: max(ideal.height, 34))
         toast.alphaValue = 0
+        toast.onDismissed = { [weak self, weak toast] in
+            guard let self = self, let toast = toast,
+                  toast.superview == nil, self.subviews.isEmpty, !self.queued.isEmpty else { return }
+            self.present(self.queued.removeFirst(), in: self.bounds)
+        }
         addSubview(toast)
+        toast.scheduleAutoDismiss(after: toast.hasAction ? 8 : 4.5)
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.22
             toast.animator().alphaValue = 1
@@ -510,14 +538,22 @@ enum UIUtil {
     }
 }
 
-/// 简易闭包-动作登记（NSButton target）
+/// 简易闭包-动作登记（NSButton target）。
+/// 弱引用登记：按钮释放即清条目——ObjectIdentifier 是内存地址，按钮销毁后
+/// 地址可被新按钮复用，不清理会把旧闭包 fired 到新按钮上（且 map 只增不减泄漏）。
 final class ActionBox: NSObject {
     static let shared = ActionBox()
-    private var map: [ObjectIdentifier: (() -> Void)] = [:]
+    private struct Entry {
+        weak var button: NSButton?
+        let action: () -> Void
+    }
+    private var entries: [Entry] = []
     func register(_ button: NSButton, _ action: @escaping () -> Void) {
-        map[ObjectIdentifier(button)] = action
+        entries.removeAll { $0.button == nil || $0.button === button }
+        entries.append(Entry(button: button, action: action))
     }
     @objc func fire(_ sender: NSButton) {
-        map[ObjectIdentifier(sender)]?()
+        entries.removeAll { $0.button == nil }
+        entries.first { $0.button === sender }?.action()
     }
 }

@@ -26,11 +26,18 @@ enum FileDigest {
         let chunk = 262144
         while remain > 0 {
             let want = Int(min(Int64(chunk), remain))
-            let d = fh.readData(ofLength: want)
-            if d.isEmpty { break }
-            acc.append(d)
-            remain -= Int64(d.count)
-            if d.count < want { break } // 文件先于请求长度结束
+            // POSIX read：IO 错误返回 -1（截断指纹由长度校验判 nil），
+            // 不用 FileHandle.readData——它读错误时抛 ObjC 异常，Swift 接不住会崩溃
+            var tmp = [UInt8](repeating: 0, count: want)
+            var n = -1
+            while true {
+                n = read(fh.fileDescriptor, &tmp, want)
+                if n >= 0 || errno != EINTR { break }
+            }
+            if n <= 0 { break }
+            acc.append(contentsOf: tmp[0..<n])
+            remain -= Int64(n)
+            if n < want { break } // 文件先于请求长度结束
         }
         return acc
     }

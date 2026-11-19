@@ -18,6 +18,8 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
     private var selected: Set<String> = []      // localIdentifier
     private var anchorIndex: Int?
     private var exporting = false
+    /// 导出进行中关闭选择器 = 取消：剩余资产不再导出，已导出的也不入队
+    private var exportCanceled = false
 
     // 相册导航
     private var mode: PickerMode = .recent
@@ -36,6 +38,9 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
     private let authButton = CapsuleButton("允许访问照片", style: .primary)
     private let authHint = UIUtil.label("需要先允许访问照片图库，才能挑选要发送的照片和视频", size: 13, color: .secondaryLabelColor, align: .center)
     private var authorizedAccess = false
+    /// 授权被拒（denied/restricted）：系统不会再弹授权框，按钮改为引导去系统设置
+    private var permissionDenied = false
+    private var activeObserver: NSObjectProtocol?
 
     // 顶部来源页签 + 相册面包屑
     private var sourceButtons: [CapsuleButton] = []
@@ -69,10 +74,23 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
         root.addSubview(spinner)
 
         authHint.isHidden = true
+        authHint.lineBreakMode = .byWordWrapping
+        authHint.maximumNumberOfLines = 0
+        authHint.preferredMaxLayoutWidth = 560
         authHint.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(authHint)
         authButton.isHidden = true
-        authButton.tapAction = { [weak self] in self?.requestAccessAndLoad() }
+        authButton.tapAction = { [weak self] in
+            guard let self = self else { return }
+            if self.permissionDenied {
+                // 直达「隐私与安全性 → 照片」面板；授权后回到 App 会自动重查（didBecomeActive）
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos") {
+                    NSWorkspace.shared.open(url)
+                }
+            } else {
+                self.requestAccessAndLoad()
+            }
+        }
         authButton.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(authButton)
 
@@ -176,6 +194,12 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
             self.onClose()
             self.window = nil
         }
+        // 用户去系统设置改授权后回到 App：自动重查，不用手动再点一次
+        activeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self, self.permissionDenied, self.window != nil else { return }
+            self.requestAccessAndLoad()
+        }
         requestAccessAndLoad()
     }
 
@@ -184,6 +208,11 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
     }
 
     func windowWillClose(_ notification: Notification) {
+        if exporting { exportCanceled = true }
+        if let obs = activeObserver {
+            NotificationCenter.default.removeObserver(obs)
+            activeObserver = nil
+        }
         onClose()
         window = nil
     }
@@ -196,15 +225,22 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.spinner.stopAnimation(nil)
-                if status == .authorized {
+                // rawValue 4 = limited（macOS 11+ 的「选中照片」授权，SDK 10.15 无此枚举）：同样可用
+                if status == .authorized || status.rawValue == 4 {
                     self.authorizedAccess = true
+                    self.permissionDenied = false
                     self.authHint.isHidden = true
                     self.authButton.isHidden = true
                     self.applyMode(self.mode)
                 } else {
                     self.authorizedAccess = false
+                    self.permissionDenied = (status == .denied || status == .restricted)
                     self.authHint.isHidden = false
+                    self.authHint.stringValue = self.permissionDenied
+                        ? "照片图库访问被拒绝。请到「系统设置 → 隐私与安全性 → 照片」里允许 MiTV Helper，然后回到这里"
+                        : "需要先允许访问照片图库，才能挑选要发送的照片和视频"
                     self.authButton.isHidden = false
+                    self.authButton.title = self.permissionDenied ? "打开系统设置" : "允许访问照片"
                     self.emptyLabel.isHidden = false
                     self.emptyLabel.stringValue = "还没有允许访问照片图库"
                 }
@@ -228,6 +264,8 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
     /// 按当前模式加载数据并刷新网格
     private func applyMode(_ m: PickerMode) {
         spinner.startAnimation(nil)
+        // 主线程快照导航状态：后台队列不得读 albumStack（UI 状态，主线程随时可改）
+        let albumParent = albumStack.last
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             switch m {
             case .recent:
@@ -248,11 +286,11 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
                 let fetched = PHAsset.fetchAssets(with: .video, options: options)
                 DispatchQueue.main.async { self?.setAssets(fetched, crumb: nil) }
             case .albums:
-                let list = (self?.albumStack.isEmpty == true) ? Self.topLevelCollections() : self?.children(of: self!.albumStack.last!)
+                let list = albumParent.map { Self.children(of: $0) } ?? Self.topLevelCollections()
                 DispatchQueue.main.async {
                     guard let self = self else { return }
                     self.spinner.stopAnimation(nil)
-                    self.collections = list ?? []
+                    self.collections = list
                     self.showingCollections = true
                     self.assets = nil
                     self.refreshNavChrome()
@@ -277,7 +315,7 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
     }
 
     /// 文件夹的直接子项（相册/子文件夹）
-    private func children(of list: PHCollection) -> [PHCollection] {
+    private static func children(of list: PHCollection) -> [PHCollection] {
         guard let folder = list as? PHCollectionList else { return [] }
         let children = PHCollectionList.fetchCollections(in: folder, options: nil)
         var out: [PHCollection] = []
@@ -327,7 +365,7 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
             albumStack.append(folder)
             spinner.startAnimation(nil)
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let sub = self?.children(of: folder) ?? []
+                let sub = Self.children(of: folder)
                 DispatchQueue.main.async {
                     guard let self = self else { return }
                     self.spinner.stopAnimation(nil)
@@ -347,18 +385,19 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
         guard mode == .albums, !albumStack.isEmpty else { return }
         albumStack.removeLast()
         spinner.startAnimation(nil)
+        let parent = albumStack.last // 主线程快照，后台不再读 albumStack
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
             let list: [PHCollection]
             let crumb: String?
-            if let top = self.albumStack.last {
-                list = self.children(of: top)
+            if let top = parent {
+                list = Self.children(of: top)
                 crumb = top.localizedTitle
             } else {
                 list = Self.topLevelCollections()
                 crumb = ""
             }
             DispatchQueue.main.async {
+                guard let self = self else { return }
                 self.spinner.stopAnimation(nil)
                 self.collections = list
                 self.showingCollections = true
@@ -411,6 +450,7 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
     private func exportSelected() {
         guard !exporting, !selected.isEmpty else { return }
         exporting = true
+        exportCanceled = false
         // 直接按 localIdentifier 集合导出（exportOne 内部再 fetch 单个资产）：
         // 用户可跨页签/相册勾选，不受当前显示列表限制
         let ids: [String] = Array(selected)
@@ -426,6 +466,7 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
         func finish() {
             try? FileManager.default.removeItem(at: tmpDir)
             exporting = false
+            if exportCanceled { return } // 用户已关闭选择器：不入队、不提示
             let done = urls
             selected.removeAll()
             updateBar()
@@ -434,6 +475,9 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
                     (NSApp.delegate as? AppDelegate)?.coordinator.showToast("导出没有成功（可能正在从 iCloud 下载原件，稍后再试）")
                 }
             } else {
+                if failed > 0 {
+                    (NSApp.delegate as? AppDelegate)?.coordinator.showToast("已导出 \(done.count) 项 · \(failed) 项没有成功（可能正在从 iCloud 下载原件，稍后可重试）")
+                }
                 close()
                 onDone(done)
             }
@@ -441,8 +485,9 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
 
         func exportOne(_ i: Int) {
             guard i < ids.count else { finish(); return }
+            if exportCanceled { finish(); return }
             let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [ids[i]], options: nil)
-            guard let asset = fetch.firstObject else { exportOne(i + 1); return }
+            guard let asset = fetch.firstObject else { failed += 1; exportOne(i + 1); return }
             bar.setExportProgress("正在导出 \(i + 1)/\(ids.count)…")
 
             let resources = PHAssetResource.assetResources(for: asset)
@@ -457,16 +502,23 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
             let safeBase = originalName.isEmpty ? "export-\(i)" : (originalName as NSString).deletingPathExtension
             let safeExt = (originalName as NSString).pathExtension.isEmpty ? ext : (originalName as NSString).pathExtension
             let tmpFile = tmpDir.appendingPathComponent("\(safeBase).\(safeExt)")
+            // 同名资产（不同相册的 IMG_0001.HEIC 等）：writeData 要求目标不存在，
+            // 上一份已 stage 拷贝走但 tmp 还在 → 先清掉，否则第二份起全部失败
+            try? FileManager.default.removeItem(at: tmpFile)
             let options = PHAssetResourceRequestOptions()
             options.isNetworkAccessAllowed = true // iCloud 原件
             PHAssetResourceManager.default().writeData(for: resource, toFile: tmpFile, options: options) { error in
                 DispatchQueue.main.async {
+                    if self.exportCanceled { finish(); return }
                     guard error == nil else {
                         failed += 1
+                        try? FileManager.default.removeItem(at: tmpFile)
                         exportOne(i + 1)
                         return
                     }
                     stagedRoot.stage(from: tmpFile) { result in
+                        try? FileManager.default.removeItem(at: tmpFile)
+                        if self.exportCanceled { finish(); return }
                         switch result {
                         case .success(let url): urls.append(url)
                         case .failure: failed += 1

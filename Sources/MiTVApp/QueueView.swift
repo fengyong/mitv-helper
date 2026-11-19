@@ -144,7 +144,9 @@ final class QueueView: NSView {
         let speed = busy.reduce(0.0) { $0 + $1.bytesPerSecond }
         if !busy.isEmpty {
             let left = busy.reduce(Int64(0)) { $0 + max(0, $1.sizeBytes - $1.bytes) }
-            var text = "正在发送 \(busy.count) 项"
+            let ups = busy.filter { $0.direction == .upload }.count
+            let verb = ups == busy.count ? "正在发送" : (ups == 0 ? "正在取回" : "正在传输")
+            var text = "\(verb) \(busy.count) 项"
             if let spd = Fmt.speed(speed), speed > 0 { text += " · \(spd)" }
             if let eta = Fmt.eta(left, bps: speed) { text += " · \(eta)" }
             summaryLabel.stringValue = text
@@ -208,6 +210,8 @@ final class QueueView: NSView {
         totalsLabel.stringValue = "总进度 \(pct)% · 完成 \(doneAll)" + (queued > 0 ? " · 排队 \(queued)" : "") + (total == 0 ? "" : " · 共 \(total) 项")
         clearButton.isHidden = snapshot.filter { $0.phase.isTerminal }.isEmpty
         let anyBusy = snapshot.contains { $0.isBusy }
+        // 全部终态时没有可暂停/继续的对象，按钮隐藏（否则「全部继续」点了没反应）
+        pauseAllButton.isHidden = !snapshot.contains { !$0.phase.isTerminal }
         pauseAllButton.title = anyBusy ? "全部暂停" : "全部继续"
     }
 }
@@ -217,6 +221,7 @@ final class FlippedStack: NSView {
     var spacing: CGFloat = 8 { didSet { layoutSubviews() } }
     var edgeInsets = NSEdgeInsets() { didSet { layoutSubviews() } }
     private var subviewsList: [NSView] = []
+    private var boundsObserver: NSObjectProtocol?
 
     var documentViewHeight: CGFloat { bounds.height }
 
@@ -228,6 +233,25 @@ final class FlippedStack: NSView {
     }
 
     override var isFlipped: Bool { true }
+
+    // 窗口缩放时裁剪视图宽度变化不会触发 documentView 重排（旧实现要等下一秒定时器才跟上）
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        if let old = boundsObserver {
+            NotificationCenter.default.removeObserver(old)
+            boundsObserver = nil
+        }
+        guard let clip = superview else { return }
+        clip.postsBoundsChangedNotifications = true
+        boundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
+            self?.layoutSubviews()
+        }
+    }
+
+    deinit {
+        if let old = boundsObserver { NotificationCenter.default.removeObserver(old) }
+    }
 
     private func layoutSubviews() {
         guard let sup = superview else { return }
@@ -357,6 +381,7 @@ final class QueueCardView: NSView {
 
             destLabel.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
             destLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 2),
+            destLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
 
             progress.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
             progress.topAnchor.constraint(equalTo: destLabel.bottomAnchor, constant: 5),
@@ -425,13 +450,15 @@ final class QueueCardView: NSView {
         switch item.direction {
         case .upload:
             if let dir = item.remoteDir {
-                let name = dir == "/" ? "电视根目录" : dir.replacingOccurrences(of: "/", with: "")
+                // 保留层级分隔（旧实现把所有斜杠删掉，/Movies/2024 显示成 Movies2024）
+                let name = dir == "/" ? "电视根目录" : String(dir.dropFirst())
                 destLabel.stringValue = "将存到 \(name)/"
             } else {
                 destLabel.stringValue = " "
             }
         case .download:
-            destLabel.stringValue = "取回到本地"
+            let parent = (item.localPath as NSString).deletingLastPathComponent
+            destLabel.stringValue = "取回到 \((parent as NSString).abbreviatingWithTildeInPath)"
         }
         if item.needsNameMapping {
             destLabel.stringValue += "（已自动兼容命名）"

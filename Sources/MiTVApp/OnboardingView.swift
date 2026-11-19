@@ -18,18 +18,24 @@ final class TVScanner {
             let group = DispatchGroup()
             let workers = DispatchQueue.global(qos: .userInitiated)
 
-            for host in 1...254 {
-                let ip = "\(prefix).\(host)"
-                for port in ports {
-                    group.enter()
-                    workers.async {
-                        if TVScanner.isOpen(ip, port: port) {
+            // 固定 worker 池分段扫描：旧实现 254×3=762 个并发块各自阻塞 poll，
+            // GCD 会瞬时膨胀出几十上百线程（线程爆炸）；24 路顺序探测足够快且资源恒定
+            let hosts = (1...254).map { "\(prefix).\($0)" }
+            let workerCount = 24
+            let chunk = (hosts.count + workerCount - 1) / workerCount
+            for w in 0..<workerCount {
+                let slice = hosts[(w * chunk)..<(min((w + 1) * chunk, hosts.count))]
+                guard !slice.isEmpty else { continue }
+                group.enter()
+                workers.async {
+                    for ip in slice {
+                        for port in ports where TVScanner.isOpen(ip, port: port) {
                             lock.lock()
                             found.insert(ip)
                             lock.unlock()
                         }
-                        group.leave()
                     }
+                    group.leave()
                 }
             }
             group.wait()
@@ -38,8 +44,13 @@ final class TVScanner {
         }
     }
 
-    /// 通过 UDP connect 技巧获取本机出口 IP → /24 前缀
+    /// 通过 UDP connect 技巧获取本机出口 IP → /24 前缀；无默认路由时退回网卡枚举
     private static func localSubnetPrefix() -> String? {
+        if let p = prefixViaUDP() { return p }
+        return prefixViaInterfaces()
+    }
+
+    private static func prefixViaUDP() -> String? {
         let sock = socket(AF_INET, SOCK_DGRAM, 0)
         guard sock >= 0 else { return nil }
         defer { close(sock) }
@@ -61,12 +72,39 @@ final class TVScanner {
             }
         }
         guard gr == 0 else { return nil }
+        return prefixFromSockAddr(local)
+    }
+
+    /// 纯局域网（无互联网路由）时 UDP connect 会失败——枚举网卡找私网 IPv4
+    private static func prefixViaInterfaces() -> String? {
+        var ifap: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifap) == 0, let first = ifap else { return nil }
+        defer { freeifaddrs(ifap) }
+        var fallback: String?
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        while let cur = ptr {
+            defer { ptr = cur.pointee.ifa_next }
+            guard let sa = cur.pointee.ifa_addr, sa.pointee.sa_family == sa_family_t(AF_INET) else { continue }
+            if (cur.pointee.ifa_flags & UInt32(IFF_LOOPBACK)) != 0 { continue }
+            let addr = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+            guard let p = prefixFromSockAddr(addr) else { continue }
+            if p.hasPrefix("192.168.") || p.hasPrefix("10.") { return p }
+            if p.hasPrefix("172.") {
+                let second = p.split(separator: ".").dropFirst().first.flatMap { Int($0) } ?? 0
+                if (16...31).contains(second) { return p }
+            }
+            if fallback == nil { fallback = p }
+        }
+        return fallback
+    }
+
+    private static func prefixFromSockAddr(_ addr: sockaddr_in) -> String? {
         var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-        var inAddr = local.sin_addr
-        inet_ntop(AF_INET, &inAddr, &buf, socklen_t(INET_ADDRSTRLEN))
+        var inAddr = addr.sin_addr
+        guard inet_ntop(AF_INET, &inAddr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil else { return nil }
         let ip = String(cString: buf)
         let comps = ip.split(separator: ".")
-        guard comps.count == 4 else { return nil }
+        guard comps.count == 4, comps[0] != "127" else { return nil }
         return comps.prefix(3).joined(separator: ".")
     }
 
@@ -118,6 +156,9 @@ final class OnboardingOverlay: NSView {
     private let errorLabel = UIUtil.label("", size: 12, color: .systemRed, align: .center)
     private let connectSpinner = NSProgressIndicator()
     private var connectButton: CapsuleButton?
+    /// 连接进行中：重复点「连接/重试/候选」会被协调器 guard 弹回 (false, nil)，
+    /// 旧实现把这当成失败显示「连不上」误导用户；这里直接忽略重复触发
+    private var connecting = false
 
     init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
@@ -381,7 +422,6 @@ final class OnboardingOverlay: NSView {
                 b.isBordered = true
                 b.bezelStyle = .rounded
                 b.controlSize = .regular
-                b.tag = abs(ip.hashValue)
                 b.identifier = NSUserInterfaceItemIdentifier(ip)
                 self.candidatesStack.addArrangedSubview(b)
             }
@@ -395,6 +435,7 @@ final class OnboardingOverlay: NSView {
     }
 
     @objc private func connectTapped() {
+        guard !connecting else { return }
         errorLabel.isHidden = true
         var raw = addressField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return }
@@ -412,8 +453,10 @@ final class OnboardingOverlay: NSView {
         connectSpinner.startAnimation(nil)
         statusLabel.stringValue = "正在连接电视…"
         connectButton?.isHidden = true
+        connecting = true
         coordinator.connect(endpoint: endpoint, name: "客厅电视") { [weak self] ok, error in
             guard let self = self else { return }
+            self.connecting = false
             if ok {
                 self.statusLabel.stringValue = "✓ 电视已就绪"
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in

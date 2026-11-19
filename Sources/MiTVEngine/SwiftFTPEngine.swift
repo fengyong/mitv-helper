@@ -45,6 +45,27 @@ public final class SwiftFTPEngine: TransferEngine {
 
     private static let chunkSize = 262144 // 256KB
 
+    // SDK 10.15 没有 FileHandle throwing API（10.15.4 才加声明，#available 也编译不过）；
+    // 旧 readData/write 在 IO 错误时抛 ObjC 异常，Swift 接不住会崩溃 → 直接 POSIX IO。
+    private static func posixRead(_ fd: Int32, into buf: UnsafeMutablePointer<UInt8>, count: Int) throws -> Int {
+        while true {
+            let n = read(fd, buf, count)
+            if n >= 0 { return n }
+            if errno == EINTR { continue }
+            throw EngineError.ioError("读取本地文件失败（errno \(errno)）")
+        }
+    }
+
+    private static func posixWrite(_ fd: Int32, from buf: UnsafePointer<UInt8>, count: Int) throws {
+        var done = 0
+        while done < count {
+            let n = write(fd, buf + done, count - done)
+            if n > 0 { done += n; continue }
+            if n < 0 && errno == EINTR { continue }
+            throw EngineError.ioError("写入本地文件失败（errno \(errno)）")
+        }
+    }
+
     /// Swift 5.1 的 Result 没有 .error 属性——统一从这里取
     private static func failure<T>(_ result: Result<T, Error>) -> Error? {
         if case .failure(let e) = result { return e }
@@ -147,12 +168,13 @@ public final class SwiftFTPEngine: TransferEngine {
                     speed = 0
                     let data = try conn.beginTransfer(cmd: append ? "APPE" : "STOR", path: remote)
                     do {
+                        var readBuf = [UInt8](repeating: 0, count: SwiftFTPEngine.chunkSize)
                         while true {
                             if let h = handle, h.isCanceled { throw EngineError.aborted }
-                            let chunk = fh.readData(ofLength: SwiftFTPEngine.chunkSize)
-                            if chunk.isEmpty { break }
-                            try data.write(chunk)
-                            sent += Int64(chunk.count)
+                            let n = try SwiftFTPEngine.posixRead(fh.fileDescriptor, into: &readBuf, count: readBuf.count)
+                            if n == 0 { break } // EOF
+                            try data.write(Data(readBuf[0..<n]))
+                            sent += Int64(n)
                             emit(force: false)
                         }
                         data.shutdownWrite() // FIN：通知服务器数据发完
@@ -197,14 +219,14 @@ public final class SwiftFTPEngine: TransferEngine {
 
             let remote = FTPPath.normalize(remotePath)
             let fm = FileManager.default
-            if !fm.createFile(atPath: localURL.path, contents: nil, attributes: nil) {
+            // 先写同目录临时文件、成功后原子替换：连接/远端文件出问题时不碰已有本地文件
+            //（旧实现先截断已有文件再连接——远端文件已不在时本地旧文件被一并销毁）
+            let tmpURL = localURL.deletingLastPathComponent()
+                .appendingPathComponent(".mitv-dl-" + UUID().uuidString + ".part")
+            guard fm.createFile(atPath: tmpURL.path, contents: nil, attributes: nil),
+                  let fh = FileHandle(forWritingAtPath: tmpURL.path) else {
                 throw EngineError.ioError("无法创建本地文件：\(localURL.path)")
             }
-            guard let fh = FileHandle(forWritingAtPath: localURL.path) else {
-                throw EngineError.ioError("无法打开本地文件：\(localURL.path)")
-            }
-            defer { fh.closeFile() }
-            fh.truncateFile(atOffset: 0) // 覆盖式下载
 
             do {
                 let bytes = try self.withConnection(endpoint) { conn -> Int64 in
@@ -240,7 +262,9 @@ public final class SwiftFTPEngine: TransferEngine {
                             if let h = handle, h.isCanceled { throw EngineError.aborted }
                             let n = try data.read(&buf, maxCount: buf.count)
                             if n == 0 { break } // 服务器 EOF = 数据收完
-                            fh.write(Data(buf[0..<n]))
+                            try buf.withUnsafeBufferPointer { raw in
+                                try SwiftFTPEngine.posixWrite(fh.fileDescriptor, from: raw.baseAddress!, count: n)
+                            }
                             received += Int64(n)
                             emit(force: false)
                         }
@@ -257,10 +281,17 @@ public final class SwiftFTPEngine: TransferEngine {
                         throw error
                     }
                 }
+                fh.closeFile()
+                if fm.fileExists(atPath: localURL.path) {
+                    _ = try fm.replaceItemAt(localURL, withItemAt: tmpURL)
+                } else {
+                    try fm.moveItem(at: tmpURL, to: localURL)
+                }
                 return bytes
             } catch {
-                // 失败/取消：清掉半截本地文件（重试会重新创建）
-                try? fm.removeItem(at: localURL)
+                fh.closeFile()
+                // 失败/取消：只清临时文件，已有本地文件原样保留（重试会重新下载）
+                try? fm.removeItem(at: tmpURL)
                 throw error
             }
         }, completion: completion)

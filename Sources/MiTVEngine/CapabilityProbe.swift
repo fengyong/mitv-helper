@@ -111,21 +111,23 @@ enum CapabilityProbe {
         var crossOK = false
         var crossTested = false
         if storOK {
-            var targetDir: String? = dirCreated ? dProbe : nil
-            if targetDir == nil {
+            var targetDirs: [String] = dirCreated ? [dProbe] : []
+            if targetDirs.isEmpty {
                 if let lines = (try? conn.retrieveListing(cmd: "LIST", path: root)) ?? nil {
-                    for e in FTPListParser.parse(lines, parentPath: root) where e.isDirectory && e.path != root {
-                        targetDir = e.path
-                        break
-                    }
+                    // 借现成目录时多试几个：LIST 第一个可能是只读系统目录，
+                    // 只试它会把「能跨目录改名」误判成 false，软删除被错误降级
+                    targetDirs = FTPListParser.parse(lines, parentPath: root)
+                        .filter { $0.isDirectory && $0.path != root }
+                        .prefix(3).map { $0.path }
                 }
             }
-            if let target = targetDir {
+            for target in targetDirs {
                 crossTested = true
                 do {
                     try conn.rename(from: probeFile, to: FTPPath.join(target, probePrefix + "cross.bin"))
                     probeFile = FTPPath.join(target, probePrefix + "cross.bin")
                     crossOK = true
+                    break
                 } catch {
                     crossOK = false
                 }

@@ -15,13 +15,18 @@ final class StagingStore {
         try? FileManager.default.createDirectory(at: self.root, withIntermediateDirectories: true, attributes: nil)
     }
 
-    /// 把外部文件（临时导出文件）拷入暂存区，重名自动顺延；后台执行。
+    /// 把外部文件（临时导出文件）移入暂存区，重名自动顺延；后台执行。
+    /// 导出原件可能几个 GB：移动代替拷贝，省一次整文件读写（跨卷等移动失败时退回拷贝）。
     func stage(from url: URL, completion: @escaping (Result<URL, Error>) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             let dest = self.uniquedURL(for: self.root.appendingPathComponent(url.lastPathComponent))
             do {
-                try FileManager.default.copyItem(at: url, to: dest)
+                do {
+                    try FileManager.default.moveItem(at: url, to: dest)
+                } catch {
+                    try FileManager.default.copyItem(at: url, to: dest)
+                }
                 DispatchQueue.main.async { completion(.success(dest)) }
             } catch {
                 DispatchQueue.main.async { completion(.failure(error)) }

@@ -5,6 +5,7 @@ import Foundation
 final class PickService {
 
     private static let lastDirKey = "lastPickDirectory"
+    private static let lastDownloadDirKey = "lastDownloadDirectory"
 
     var lastDirectory: URL {
         get {
@@ -15,6 +16,19 @@ final class PickService {
                 ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
         }
         set { UserDefaults.standard.set(newValue.path, forKey: PickService.lastDirKey) }
+    }
+
+    /// 取回保存目录单独记忆：与「挑选发送文件」的目录互不串味（旧实现共用一个键，
+    /// 选一次保存位置就把发送面板的默认目录也改了）
+    var lastDownloadDirectory: URL {
+        get {
+            if let s = UserDefaults.standard.string(forKey: PickService.lastDownloadDirKey) {
+                return URL(fileURLWithPath: s, isDirectory: true)
+            }
+            return FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+                ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        }
+        set { UserDefaults.standard.set(newValue.path, forKey: PickService.lastDownloadDirKey) }
     }
 
     /// 选择文件或文件夹（sheet 呈现在主窗口）。文件夹递归展开媒体文件；非媒体自动忽略。
@@ -29,18 +43,22 @@ final class PickService {
         panel.directoryURL = lastDirectory
         panel.beginSheetModal(for: window ?? NSWindow()) { response in
             guard response == .OK else { completion([], 0); return }
-            var files: [URL] = []
-            for url in panel.urls {
-                var isDir: ObjCBool = false
-                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
-                    files.append(contentsOf: PickService.expandFolder(url))
-                } else {
-                    files.append(url)
-                }
-            }
+            let urls = panel.urls
             if let dir = panel.directoryURL { self.lastDirectory = dir }
-            let result = PickService.filterMedia(files)
-            completion(result.media, result.ignored)
+            // 递归展开可能扫上万文件（大文件夹/网络卷）——放后台，主线程只收结果
+            DispatchQueue.global(qos: .userInitiated).async {
+                var files: [URL] = []
+                for url in urls {
+                    var isDir: ObjCBool = false
+                    if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                        files.append(contentsOf: PickService.expandFolder(url))
+                    } else {
+                        files.append(url)
+                    }
+                }
+                let result = PickService.filterMedia(files)
+                DispatchQueue.main.async { completion(result.media, result.ignored) }
+            }
         }
     }
 
@@ -53,10 +71,10 @@ final class PickService {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = true
-        panel.directoryURL = lastDirectory
+        panel.directoryURL = lastDownloadDirectory
         panel.beginSheetModal(for: window ?? NSWindow()) { response in
             guard response == .OK, let url = panel.url else { completion(nil); return }
-            self.lastDirectory = url
+            self.lastDownloadDirectory = url
             completion(url)
         }
     }
@@ -66,6 +84,7 @@ final class PickService {
     /// 递归展开文件夹内的媒体文件（跳过隐藏文件与 .MITV-Trash 之类）
     static func expandFolder(_ folder: URL, depth: Int = 0) -> [URL] {
         guard depth < 8 else { return [] }
+        if (try? folder.resourceValues(forKeys: [.isPackageKey]))?.isPackage == true { return [] }
         let fm = FileManager.default
         guard let items = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: []) else {
             return []
@@ -73,6 +92,8 @@ final class PickService {
         var out: [URL] = []
         for item in items {
             if item.lastPathComponent.hasPrefix(".") { continue }
+            // 包（.photoslibrary/.app 等）是目录形态的单文件：钻进去会捞出图库 masters/应用资源
+            if (try? item.resourceValues(forKeys: [.isPackageKey]))?.isPackage == true { continue }
             var isDir: ObjCBool = false
             if fm.fileExists(atPath: item.path, isDirectory: &isDir), isDir.boolValue {
                 out.append(contentsOf: expandFolder(item, depth: depth + 1))

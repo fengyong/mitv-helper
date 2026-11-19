@@ -30,5 +30,26 @@ enum NameCodecTests {
         assertFalse(NameCodec.remoteName(for: "正常名字 [高清].mp4").needsMapping, "GBK 可表示且安全 → 不改写")
         assertEqual(NameCodec.uniqued("a.mp4", existing: ["A.mp4"], caseInsensitive: true), "a (2).mp4", "大小写不敏感重名顺延")
         assertEqual(NameCodec.uniqued("a.mp4", existing: ["A.mp4"]), "a.mp4", "默认大小写敏感（契约不变）")
+
+        // FAT NAME_MAX=255 字节：GBK 中文 2 字节/字，长名必须按字节截断且保留扩展名
+        func gbkBytes(_ s: String) -> Int { s.data(using: NameCodec.gbkEncoding)?.count ?? .max }
+        let longCN = String(repeating: "电", count: 200) + ".mp4"
+        let cn = NameCodec.remoteName(for: longCN)
+        assertTrue(gbkBytes(cn.remote) <= NameCodec.maxNameBytes, "中文长名截断到 255 字节内")
+        assertTrue(cn.remote.hasSuffix(".mp4"), "截断保留扩展名")
+        assertTrue(cn.needsMapping, "截断标记改写")
+        assertTrue(NameCodec.isGBKRepresentable(cn.remote), "截断结果 GBK 可表示（不切断双字节）")
+        let longASCII = String(repeating: "b", count: 300) + ".mp4"
+        assertTrue(gbkBytes(NameCodec.remoteName(for: longASCII).remote) <= NameCodec.maxNameBytes, "ASCII 长名截断")
+        assertEqual(NameCodec.capped("短名.mp4").truncated, false, "短名不截断")
+        assertEqual(NameCodec.capped("短名.mp4").name, "短名.mp4", "短名原样")
+        let nearLimit = String(repeating: "b", count: 250) + ".mp4"
+        let deduped = NameCodec.uniqued(nearLimit, existing: [nearLimit])
+        assertTrue(gbkBytes(NameCodec.capped(deduped).name) <= NameCodec.maxNameBytes, "重名顺延后再截断仍 ≤255")
+        let longTrash = SoftDeletePolicy.prefixTrashName(forRemotePath: "/" + String(repeating: "目录", count: 100) + "/" + longCN)
+        assertTrue(gbkBytes(longTrash) <= NameCodec.maxNameBytes, "回收站前缀名截断到 255 字节内")
+        assertTrue(longTrash.hasPrefix(SoftDeletePolicy.prefixTag), "截断保留回收站前缀")
+        let longFlat = SoftDeletePolicy.flattenParent(ofPath: "/" + String(repeating: "目录", count: 100) + "/f.mp4")
+        assertTrue(gbkBytes(longFlat) <= NameCodec.maxNameBytes, "扁平化父目录截断到 255 字节内")
     }
 }

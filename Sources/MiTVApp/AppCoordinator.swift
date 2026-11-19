@@ -57,9 +57,40 @@ final class AppCoordinator: NSObject {
     private var settingsController: SettingsController?
     /// 「删除前先下载」的批次登记：batchId → (待删文件, 完成回调)。整批取回成功后才执行删除
     private var pendingDeleteBatches: [String: (files: [FTPFileEntry], after: () -> Void)] = [:]
+    /// 未连接时拖入的文件：先记下，连上后自动入队（旧实现直接丢弃，用户白拖一趟）
+    private var pendingDropURLs: [URL] = []
+
+    // MARK: 「删除前先下载」持久化（退出重启后批次完成仍要执行删除，否则用户意图丢失）
+
+    private struct PendingDeleteEntry: Codable { var path: String; var name: String; var size: Int64 }
+    private var pendingDeleteFile: URL { TVStore.defaultDirectory().appendingPathComponent("pending-deletes.json") }
+
+    private func savePendingDeletes() {
+        let map = pendingDeleteBatches.mapValues { pair in
+            pair.files.map { PendingDeleteEntry(path: $0.path, name: $0.name, size: $0.size ?? 0) }
+        }
+        if let data = try? JSONEncoder().encode(map) {
+            try? data.write(to: pendingDeleteFile, options: .atomic)
+        }
+    }
+
+    private func loadPendingDeletes() {
+        guard let data = try? Data(contentsOf: pendingDeleteFile),
+              let map = try? JSONDecoder().decode([String: [PendingDeleteEntry]].self, from: data) else { return }
+        // 队列里已不存在的批次（取消/清空后退出）直接作废，避免永久残留
+        let liveBatchIds = Set(queue.snapshot().compactMap { $0.batchId })
+        for (batchId, entries) in map where liveBatchIds.contains(batchId) {
+            let files = entries.map { FTPFileEntry(path: $0.path, name: $0.name, isDirectory: false, size: $0.size) }
+            pendingDeleteBatches[batchId] = (files, {})
+        }
+        savePendingDeletes()
+    }
 
     /// 确认浮层/首连向导是否在场（浏览器键盘监听据此让路，review D4）
     var hasModalOverlay: Bool { onboarding != nil || confirmOverlay != nil }
+
+    /// 是否还有未完成的传输（关窗不退出据此判断）
+    var hasActiveTransfers: Bool { queue.snapshot().contains { !$0.phase.isTerminal } }
 
     // MARK: - Init
 
@@ -144,6 +175,7 @@ final class AppCoordinator: NSObject {
         queue.onBatchCompleted = { [weak self] batchId, ok, bad in
             self?.handleBatchCompleted(batchId: batchId, ok: ok, bad: bad)
         }
+        loadPendingDeletes()
         heartbeat.onStatus = { [weak self] status in self?.handleHeartbeat(status) }
 
         showState(emptyView)
@@ -349,7 +381,9 @@ final class AppCoordinator: NSObject {
         let speed = busy.reduce(0.0) { $0 + $1.bytesPerSecond }
         if !busy.isEmpty {
             let totalLeft = busy.reduce(Int64(0)) { $0 + max(0, ($1.sizeBytes - $1.bytes)) }
-            var text = "正在发送 \(busy.count) 项"
+            let ups = busy.filter { $0.direction == .upload }.count
+            let verb = ups == busy.count ? "正在发送" : (ups == 0 ? "正在取回" : "正在传输")
+            var text = "\(verb) \(busy.count) 项"
             if let eta = Fmt.eta(totalLeft, bps: speed) { text += " · \(eta)" }
             statusBar.set(left: text, right: queued.isEmpty ? nil : "排队 \(queued.count) 项")
         } else if heartbeatStatus == .connected {
@@ -385,6 +419,11 @@ final class AppCoordinator: NSObject {
                 self.refreshHeader()
                 self.updateStatusBar()
                 if !silent { self.showToast("已连接电视") }
+                if !self.pendingDropURLs.isEmpty {
+                    let urls = self.pendingDropURLs
+                    self.pendingDropURLs = []
+                    self.enqueueFileURLs(urls)
+                }
                 completion?(true, nil)
             case .failure(let error):
                 FileHandle.standardError.write(Data("[diag] probe FAIL: \(error.localizedDescription)\n".utf8))
@@ -455,7 +494,8 @@ final class AppCoordinator: NSObject {
             return
         }
         guard store.endpoint != nil, store.state.onboardingDone else {
-            showToast("先连接电视，再把文件拖进来")
+            pendingDropURLs = urls
+            showToast("先连接电视，连上后自动发送这些文件")
             showOnboarding()
             return
         }
@@ -474,6 +514,7 @@ final class AppCoordinator: NSObject {
     private func handleBatchCompleted(batchId: String, ok: Int, bad: Int) {
         // 「删除前先下载」的批次：整批取回成功才执行删除，失败则中止（数据安全兜底）
         if let pending = pendingDeleteBatches.removeValue(forKey: batchId) {
+            savePendingDeletes()
             if bad == 0 {
                 deleteRemote(pending.files, after: pending.after)
             } else {
@@ -527,8 +568,7 @@ final class AppCoordinator: NSObject {
 
     func showToast(_ text: String, undo: (() -> Void)? = nil) {
         let toast = ToastView(text: text, actionTitle: undo == nil ? nil : "撤销", action: undo)
-        toastHost.show(toast, in: toastHost.bounds)
-        toast.scheduleAutoDismiss(after: undo == nil ? 4.5 : 8)
+        toastHost.show(toast, in: toastHost.bounds) // 自动退场时长由宿主按有无撤销统一管理
     }
 
     // MARK: - 各入口
@@ -598,6 +638,7 @@ final class AppCoordinator: NSObject {
                 let items = self.queue.addDownloads(filesToDelete, toDirectory: dir)
                 guard let batchId = items.first?.batchId else { after(); return }
                 self.pendingDeleteBatches[batchId] = (filesToDelete, after)
+                self.savePendingDeletes()
                 self.setMode(.home)
                 self.showToast("先把 \(items.count) 项取回本地 · 全部成功后才会删除")
             }
@@ -624,7 +665,7 @@ final class AppCoordinator: NSObject {
                                             progress: { _, _, _ in }) { restored, failed in
                             guard let self = self else { return }
                             if restored > 0 { self.showToast("已还原 \(restored) 项") }
-                            if failed > 0 { self.showToast("有 \(failed) 项还原失败") }
+                            if failed > 0 { self.showToast("有 \(failed) 项未还原（原位置已有同名文件或连接失败）· 仍在回收站") }
                             // 撤销后刷新界面（review D2）：不刷的话文件已回来但列表缺失，用户会以为撤销失败
                             if self.mode == .browser {
                                 self.browserView.reloadAfterRestore()

@@ -9,7 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        // 传输中关窗不退出（AirDrop 手感）：后台继续传，点 Dock 图标可回到窗口
+        !coordinator.hasActiveTransfers
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

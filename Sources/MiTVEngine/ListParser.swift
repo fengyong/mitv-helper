@@ -32,8 +32,12 @@ enum FTPListParser {
         }
 
         let first = trimmed.first ?? "-"
-        // 单 token 行 / 首字符非类型位 → 裸文件名行（NLIST、部分嵌入式服务器；整行作名字，空格保留）
-        let looksLikeUnixPerms = tokens.count >= 2 && "-dlbcpsDL".contains(first)
+        // 单 token 行 / 首 token 非权限串 → 裸文件名行（NLIST、部分嵌入式服务器；整行作名字，空格保留）。
+        // 权限串判定必须看整个 token（≥9 位且全是权限字符）：只看首字母会把
+        // "dance party.mp4" 这类 d/l/b/c/p/s 开头的多词文件名误当 unix 行，截得只剩最后一个词。
+        let permChars = "-rwxXstSTdlbcp+@"
+        let looksLikeUnixPerms = tokens.count >= 2 && tokens[0].count >= 9
+            && tokens[0].allSatisfy { permChars.contains($0) }
         if !looksLikeUnixPerms {
             var name = trimmed
             var isDir = false
@@ -265,7 +269,8 @@ enum FTPMLSDParser {
                             isDirectory: isDir, size: size, modified: modified)
     }
 
-    /// YYYYMMDDHHMMSS（容忍小数毫秒/时区尾巴）→ Date
+    /// YYYYMMDDHHMMSS（容忍小数毫秒/时区尾巴）→ Date。
+    /// RFC 3659：MLSD 的 modify 是 UTC——按本地时区解释会整体偏移（东八区差 8 小时）
     static func parseTimestamp(_ s: String) -> Date? {
         let digits = s.prefix(14)
         guard digits.count == 14 else { return nil }
@@ -279,6 +284,8 @@ enum FTPMLSDParser {
         var comps = DateComponents()
         comps.year = y; comps.month = mo; comps.day = d
         comps.hour = h; comps.minute = mi; comps.second = se
-        return Calendar(identifier: .gregorian).date(from: comps)
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        return cal.date(from: comps)
     }
 }

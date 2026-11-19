@@ -17,6 +17,11 @@ enum ServiceTests_B {
         testEmptyDiskFallback()
         testAutoMakeDir()
         testThumbCacheStore()
+        testTrashSafety()
+        testEmptyTrash()
+        testPauseAllCancelsHandles()
+        testBatchNameCollisions()
+        testThumbFetchSafety()
     }
 
     // MARK: - 队列状态机
@@ -211,13 +216,38 @@ enum ServiceTests_B {
         assertEqual(store2.state.tvName, "客厅电视", "昵称 round-trip")
         assertEqual(store2.state.lastRemotePath, "/Movies", "上次目录 round-trip")
         assertTrue(store2.state.onboardingDone, "向导完成标记 round-trip")
+
+        // 并发冒烟：后台写 + 并发读不崩溃、终值有效（state 快照与 update 同锁守卫）
+        let group = DispatchGroup()
+        let pool = DispatchQueue(label: "mitv.test.tvstore", attributes: .concurrent)
+        for i in 0..<50 {
+            group.enter()
+            pool.async {
+                store.update { $0.tvName = "并发\(i)" }
+                group.leave()
+            }
+        }
+        group.enter()
+        pool.async {
+            for _ in 0..<200 { _ = store.endpoint; _ = store.state.tvName }
+            group.leave()
+        }
+        assertTrue(group.wait(timeout: .now() + 10) == .success, "TVStore 并发读写完成")
+        assertTrue(store.state.tvName?.hasPrefix("并发") == true, "并发写后终值有效")
     }
 
     // MARK: - QueueService 集成（真实服务 + 桩引擎，确定性回调）
 
     final class InlineEngine: TransferEngine {
         struct UploadCall { var remotePath: String; var resume: Bool }
+        struct MoveCall { var from: String; var to: String }
         private(set) var uploadCalls: [UploadCall] = []
+        private(set) var moveCalls: [MoveCall] = []
+        private(set) var deleteCalls: [String] = []
+        /// 指定路径的 delete 以失败收场（清空回收站部分失败测试用）
+        var failDeletePaths: Set<String> = []
+        private(set) var uploadHandles: [TransferHandle?] = []
+        private(set) var downloadHandles: [TransferHandle?] = []
         /// true 时 upload 完成回调被扣住，供测试精确控制时序；false 时延迟自动成功/失败
         var hangUploads = false
         /// true 时 upload 以失败收场
@@ -225,8 +255,13 @@ enum ServiceTests_B {
         var pendingUploadCompletions: [(Result<Int64, Error>) -> Void] = []
         /// list 返回的目录内容（重名判定测试用）
         var dirEntries: [FTPFileEntry] = [FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true)]
+        /// 按路径覆盖 list 结果（回收站去重/还原守卫测试用）
+        var dirEntriesByPath: [String: [FTPFileEntry]] = [:]
         /// true 时所有 list 以失败收场（空盘/列表降级测试）
         var failAllLists = false
+        /// true 时 download 完成回调被扣住（跨批次下载互斥测试用）
+        var hangDownloads = false
+        var pendingDownloadCompletions: [(Result<Int64, Error>) -> Void] = []
         /// 指定路径的 list 以失败收场（目录存在但列不出内容的怪癖模拟）
         var failListPath: String?
         /// MKD 是否成功（真机 SwiFTP 550 → false）
@@ -270,7 +305,7 @@ enum ServiceTests_B {
                     completion(.failure(EngineError.connectionFailed("模拟目录列表失败")))
                     return
                 }
-                completion(.success(self.dirEntries))
+                completion(.success(self.dirEntriesByPath[path] ?? self.dirEntries))
             }
         }
         func downloadPrefix(_ endpoint: FTPEndpoint, remotePath: String, maxBytes: Int,
@@ -287,14 +322,35 @@ enum ServiceTests_B {
         func upload(_ endpoint: FTPEndpoint, from localURL: URL, to remotePath: String, resume: Bool,
                     handle: TransferHandle?, onProgress: ((TransferProgress) -> Void)?,
                     completion: @escaping (Result<Int64, Error>) -> Void) {
+            lock.lock(); uploadHandles.append(handle); lock.unlock()
             record(remotePath, resume, completion)
         }
         func download(_ endpoint: FTPEndpoint, remotePath: String, to localURL: URL, handle: TransferHandle?,
                       onProgress: ((TransferProgress) -> Void)?, completion: @escaping (Result<Int64, Error>) -> Void) {
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.02) { completion(.success(1)) }
+            lock.lock()
+            downloadHandles.append(handle)
+            let hang = hangDownloads
+            if hang { pendingDownloadCompletions.append(completion) }
+            lock.unlock()
+            if !hang {
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.02) { completion(.success(1)) }
+            }
         }
-        func delete(_ endpoint: FTPEndpoint, remotePath: String, completion: @escaping (Error?) -> Void) { DispatchQueue.global().async { completion(nil) } }
-        func move(_ endpoint: FTPEndpoint, from: String, to: String, completion: @escaping (Error?) -> Void) { DispatchQueue.global().async { completion(nil) } }
+        func releaseAllDownloads(_ result: Result<Int64, Error>) {
+            lock.lock(); let cbs = pendingDownloadCompletions; pendingDownloadCompletions = []; lock.unlock()
+            for cb in cbs { cb(result) }
+        }
+        func delete(_ endpoint: FTPEndpoint, remotePath: String, completion: @escaping (Error?) -> Void) {
+            lock.lock()
+            deleteCalls.append(remotePath)
+            let fail = failDeletePaths.contains(remotePath)
+            lock.unlock()
+            DispatchQueue.global().async { completion(fail ? EngineError.permissionDenied("模拟删除失败") : nil) }
+        }
+        func move(_ endpoint: FTPEndpoint, from: String, to: String, completion: @escaping (Error?) -> Void) {
+            lock.lock(); moveCalls.append(MoveCall(from: from, to: to)); lock.unlock()
+            DispatchQueue.global().async { completion(nil) }
+        }
         func makeDirectory(_ endpoint: FTPEndpoint, path: String, completion: @escaping (Error?) -> Void) {
             DispatchQueue.global().async { completion(self.allowMKD ? nil : EngineError.unsupported("MKD")) }
         }
@@ -320,6 +376,16 @@ enum ServiceTests_B {
         let f1 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-引擎自测-\(UUID().uuidString).mp4")
         try? Data(repeating: 0, count: 10).write(to: f1)
         defer { try? FileManager.default.removeItem(at: f1) }
+        // 各步骤用不同文件：同一文件重复入队会被「已完成同文件」查重跳过（W1-3 新契约）
+        let f2 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-引擎自测-\(UUID().uuidString).mp4")
+        try? Data(repeating: 1, count: 10).write(to: f2)
+        defer { try? FileManager.default.removeItem(at: f2) }
+        let f3 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-引擎自测-\(UUID().uuidString).mp4")
+        try? Data(repeating: 2, count: 10).write(to: f3)
+        defer { try? FileManager.default.removeItem(at: f3) }
+        let f4 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-引擎自测-\(UUID().uuidString).mp4")
+        try? Data(repeating: 3, count: 10).write(to: f4)
+        defer { try? FileManager.default.removeItem(at: f4) }
 
         let engine = InlineEngine()
         let caps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
@@ -345,9 +411,16 @@ enum ServiceTests_B {
         assertFalse(engine.uploadCalls[0].resume, "首传强制整传（resume=false）：防同名旧文件被 APPE 拼接出坏文件")
         assertTrue((try? Data(contentsOf: dir.appendingPathComponent("queue.json"))) != nil, "queue.json 已写")
 
+        // 1b. 同一文件再次入队（同目标目录）→ 命中「已完成同文件」查重：直接完成+跳过说明，不再调引擎
+        _ = queue.addUploads([f1])
+        waitUntil("重复文件被跳过") { queue.snapshot().filter { $0.phase == .completed }.count == 2 }
+        let dupItem = queue.snapshot().first { $0.skippedReason != nil }
+        assertTrue(dupItem?.skippedReason != nil, "重复项带跳过说明")
+        assertEqual(engine.uploadCalls.count, 1, "重复项不再调用引擎")
+
         // 2. 悬挂上传 → 暂停 → resume（APPE 续传标志）→ 完成
         engine.hangUploads = true
-        _ = queue.addUploads([f1])
+        _ = queue.addUploads([f2])
         waitUntil("第二项进入 running") { queue.snapshot().filter { $0.phase == .running }.count == 1 }
         guard let runningID = queue.snapshot().first(where: { $0.phase == .running })?.id else {
             assertTrue(false, "未找到 running 项"); return
@@ -359,12 +432,12 @@ enum ServiceTests_B {
         waitUntil("恢复后再次调用引擎（续传第二次 upload）") { engine.uploadCalls.count == 3 }
         assertTrue(engine.uploadCalls[2].resume, "暂停恢复=同任务续传 → APPE 标志")
         engine.releaseAllUploads(.success(1))
-        waitUntil("悬挂恢复后完成") { queue.snapshot().filter { $0.phase == .completed }.count == 2 }
+        waitUntil("悬挂恢复后完成") { queue.snapshot().filter { $0.phase == .completed }.count == 3 }
 
         // 3. 失败 → 重试 → 完成
         engine.hangUploads = false
         engine.failUploads = true
-        _ = queue.addUploads([f1])
+        _ = queue.addUploads([f3])
         waitUntil("失败可见") { queue.snapshot().filter { $0.phase == .failed }.count == 1 }
         guard let failedID = queue.snapshot().first(where: { $0.phase == .failed })?.id else {
             assertTrue(false, "未找到 failed 项"); return
@@ -383,7 +456,7 @@ enum ServiceTests_B {
 
         // 5. 持久化恢复：running 状态写入 JSON，重启后（不自动续跑）回到 queued
         engine.hangUploads = true
-        _ = queue.addUploads([f1])
+        _ = queue.addUploads([f4])
         waitUntil("第四项进入 running") { queue.snapshot().filter { $0.phase == .running }.count == 1 }
         let countBefore = queue.snapshot().count
         queue.suspendForShutdown() // 模拟退出：停调度 + 原子写
@@ -393,7 +466,7 @@ enum ServiceTests_B {
         assertEqual(restored.snapshot().count, countBefore, "重启恢复队列项数")
         let restoredItem = restored.snapshot().first { $0.phase == .queued }
         assertTrue(restoredItem != nil, "running 项恢复为 queued（等待续传）")
-        assertEqual(restoredItem?.displayName, f1.lastPathComponent, "恢复项信息完整")
+        assertEqual(restoredItem?.displayName, f4.lastPathComponent, "恢复项信息完整")
     }
 }
 
@@ -450,7 +523,12 @@ extension ServiceTests_B {
         assertTrue(store2.lookup(path: "/Pictures/a.jpg", size: 2048) == nil, "删除后 miss")
 
         // 超限剪枝：上限 10，插 16 条 → 剩 ≤10（按 created_at 删最旧）
-        let small = ThumbCacheStore(directory: dir.appendingPathComponent("small"), maxEntries: 10)
+        let smallDir = dir.appendingPathComponent("small")
+        let small = ThumbCacheStore(directory: smallDir, maxEntries: 10)
+        // 预置缩略图文件本体：剪枝必须连带删文件，否则磁盘孤儿只增不减
+        for i in 1...16 {
+            try? Data("x".utf8).write(to: smallDir.appendingPathComponent("f\(i).jpg"))
+        }
         for i in 1...16 {
             small.store(path: "/p/\(i).jpg", size: Int64(i), digest: nil, file: "f\(i).jpg")
         }
@@ -458,6 +536,64 @@ extension ServiceTests_B {
         assertTrue(left <= 10, "超限剪枝到上限内（实际 \(left)）")
         assertTrue(small.lookup(path: "/p/1.jpg", size: 1) == nil, "最旧的被剪掉")
         assertTrue(small.lookup(path: "/p/16.jpg", size: 16) != nil, "最新的保留")
+        assertFalse(FileManager.default.fileExists(atPath: smallDir.appendingPathComponent("f1.jpg").path),
+                    "被剪记录的缩略图文件一并删除")
+        assertTrue(FileManager.default.fileExists(atPath: smallDir.appendingPathComponent("f16.jpg").path),
+                   "保留记录的文件仍在")
+    }
+}
+
+// MARK: - 缩略图获取：并发上限 / 同路径共享 / 取消 / 负缓存
+
+extension ServiceTests_B {
+
+    static func testThumbFetchSafety() {
+        print("· 缩略图获取并发/取消/负缓存")
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-thumb-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let engine = InlineEngine()
+        engine.hangDownloads = true
+        let files = TVFileService(engineProvider: { engine },
+                                  endpointProvider: { FTPEndpoint(host: "mock") },
+                                  capabilitiesProvider: { Capabilities() },
+                                  trashStore: TrashStore(directory: dir),
+                                  thumbDirectory: dir.appendingPathComponent("thumbs"))
+        func entry(_ name: String) -> FTPFileEntry {
+            FTPFileEntry(path: "/Pictures/" + name, name: name, isDirectory: false, size: 100, modified: nil)
+        }
+        let a = entry("a.jpg")
+
+        // 同路径重复请求共享一次下载（网格重配置/定时器不会叠连接）
+        files.fetchThumbnail(a) { _ in }
+        waitUntil("首个缩略图下载启动") { engine.pendingDownloadCompletions.count == 1 }
+        files.fetchThumbnail(a) { _ in }
+        Thread.sleep(forTimeInterval: 0.1)
+        assertEqual(engine.pendingDownloadCompletions.count, 1, "同路径再请求不叠加下载")
+
+        // 取消 = 断下载句柄，且不进负缓存（滚回来还能重新取）
+        files.cancelThumbnail(forPath: a.path)
+        assertTrue(engine.downloadHandles.last??.isCanceled == true, "取消断下载句柄")
+        engine.releaseAllDownloads(.failure(EngineError.aborted))
+        Thread.sleep(forTimeInterval: 0.15) // 等后台收尾释放槽位/清 pending，再重新请求
+        files.fetchThumbnail(a) { _ in }
+        waitUntil("取消后可重新取（无负缓存污染 + 槽位已释放）") { engine.pendingDownloadCompletions.count == 1 }
+
+        // 真失败 → 负缓存：本会话不再重试
+        engine.releaseAllDownloads(.failure(EngineError.ioError("模拟失败")))
+        Thread.sleep(forTimeInterval: 0.15) // 等后台收尾把负缓存写入
+        files.fetchThumbnail(a) { _ in }
+        Thread.sleep(forTimeInterval: 0.1)
+        assertEqual(engine.pendingDownloadCompletions.count, 0, "失败后进负缓存不再下载")
+
+        // 并发上限 2：三个新路径只起两路，第三路排队；释放一个槽位后排队项顶上
+        files.fetchThumbnail(entry("b.jpg")) { _ in }
+        files.fetchThumbnail(entry("c.jpg")) { _ in }
+        files.fetchThumbnail(entry("d.jpg")) { _ in }
+        waitUntil("两路并发启动") { engine.pendingDownloadCompletions.count == 2 }
+        Thread.sleep(forTimeInterval: 0.1)
+        assertEqual(engine.pendingDownloadCompletions.count, 2, "并发上限 2，第三路排队")
+        engine.releaseAllDownloads(.failure(EngineError.ioError("模拟失败")))
+        waitUntil("释放槽位后排队项顶上") { engine.pendingDownloadCompletions.count == 1 }
     }
 }
 
@@ -722,6 +858,296 @@ extension ServiceTests_B {
             waitUntil("仅大小写不同的同名 → 跳过") { queue.snapshot().first?.phase == .completed }
             assertEqual(engine.uploadCalls.count, 0, "大小写不同也不覆盖（FAT 语义）")
             assertTrue(queue.snapshot().first?.skippedReason != nil, "按相同文件跳过")
+        }
+    }
+}
+
+// MARK: - 回收站数据安全（目标去重 / 还原占用守卫）
+
+extension ServiceTests_B {
+
+    /// 线程安全结果盒（restore 完成回调在后台队列）
+    final class RestoreBox {
+        private let lock = NSLock()
+        private var _ok = -1
+        private var _bad = -1
+        var ok: Int { lock.lock(); defer { lock.unlock() }; return _ok }
+        var bad: Int { lock.lock(); defer { lock.unlock() }; return _bad }
+        func set(_ ok: Int, _ bad: Int) { lock.lock(); _ok = ok; _bad = bad; lock.unlock() }
+    }
+
+    static func testTrashSafety() {
+        print("· 回收站数据安全")
+        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-trash-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let softCaps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
+                                    mkdir: true, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+        let trashDirEntry = FTPFileEntry(path: "/.MITV-Trash", name: ".MITV-Trash", isDirectory: true)
+        let moviesDir = FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true)
+        let victim = FTPFileEntry(path: "/Movies/a.mp4", name: "a.mp4", isDirectory: false, size: 5)
+
+        // 1) 目录形态：回收站已有同名旧文件 → 目标顺延，不覆盖先删的文件
+        do {
+            let engine = InlineEngine()
+            engine.allowMKD = true
+            engine.dirEntriesByPath["/"] = [moviesDir, trashDirEntry]
+            engine.dirEntriesByPath["/.MITV-Trash/Movies"] =
+                [FTPFileEntry(path: "/.MITV-Trash/Movies/a.mp4", name: "a.mp4", isDirectory: false, size: 5)]
+            let trash = TrashStore(directory: baseDir.appendingPathComponent("t1"))
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { softCaps }, trashStore: trash)
+            service.deleteEntries([victim], progress: { _, _, _ in }) { _ in }
+            waitUntil("软删除完成记账") { trash.count == 1 }
+            assertEqual(engine.moveCalls.last?.to, "/.MITV-Trash/Movies/a (2).mp4", "回收站同名 → 顺延不覆盖")
+            assertEqual(trash.records.first?.trashPath, "/.MITV-Trash/Movies/a (2).mp4", "记账指向顺延后的真实路径")
+
+            // 2) 删→重传→再删：本地记账 + 远端列表合并去重 → 继续顺延
+            service.deleteEntries([victim], progress: { _, _, _ in }) { _ in }
+            waitUntil("第二次删除记账") { trash.count == 2 }
+            assertEqual(engine.moveCalls.last?.to, "/.MITV-Trash/Movies/a (3).mp4", "二次删除继续顺延（先删文件不被销毁）")
+        }
+
+        // 3) 前缀形态：根目录已有同前缀名 → 同样顺延
+        do {
+            let engine = InlineEngine()
+            engine.dirEntriesByPath["/"] = [moviesDir,
+                FTPFileEntry(path: "/.MITV-Trash--Movies--a.mp4", name: ".MITV-Trash--Movies--a.mp4", isDirectory: false, size: 5)]
+            let prefixCaps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
+                                          mkdir: false, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+            let trash = TrashStore(directory: baseDir.appendingPathComponent("t2"))
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { prefixCaps }, trashStore: trash)
+            service.deleteEntries([victim], progress: { _, _, _ in }) { _ in }
+            waitUntil("前缀形态删除记账") { trash.count == 1 }
+            assertEqual(engine.moveCalls.last?.to, "/.MITV-Trash--Movies--a (2).mp4", "前缀形态同名也顺延")
+        }
+
+        // 4) 还原守卫：原路径已被重新上传的同名文件占用 → 跳过不覆盖，记录保留
+        do {
+            let engine = InlineEngine()
+            engine.dirEntriesByPath["/Movies"] = [victim]
+            let trash = TrashStore(directory: baseDir.appendingPathComponent("t3"))
+            trash.add(TrashStore.Record(id: "r1", trashPath: "/.MITV-Trash/Movies/a.mp4",
+                                        originalPath: "/Movies/a.mp4", name: "a.mp4", sizeBytes: 5, deletedAt: Date()))
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { softCaps }, trashStore: trash)
+            let box = RestoreBox()
+            service.restore(trash.records, progress: { _, _, _ in }) { ok, bad in box.set(ok, bad) }
+            waitUntil("占用还原返回") { box.ok >= 0 }
+            assertEqual(box.ok, 0, "占用时不还原")
+            assertEqual(box.bad, 1, "占用计为失败")
+            assertEqual(engine.moveCalls.count, 0, "占用时不发起 move（不覆盖重传文件）")
+            assertEqual(trash.count, 1, "记录保留在回收站")
+
+            // 5) 原目录列不出 → 保守失败，不赌覆盖
+            engine.failListPath = "/Movies"
+            let box2 = RestoreBox()
+            service.restore(trash.records, progress: { _, _, _ in }) { ok, bad in box2.set(ok, bad) }
+            waitUntil("列不出返回") { box2.ok >= 0 }
+            assertEqual(box2.ok, 0, "原目录列不出 → 不还原")
+            assertEqual(engine.moveCalls.count, 0, "列不出也不发起 move")
+
+            // 6) 原路径空闲 → 正常还原，记录移除
+            engine.failListPath = nil
+            engine.dirEntriesByPath["/Movies"] = []
+            let box3 = RestoreBox()
+            service.restore(trash.records, progress: { _, _, _ in }) { ok, bad in box3.set(ok, bad) }
+            waitUntil("空闲还原返回") { box3.ok >= 0 }
+            assertEqual(box3.ok, 1, "空闲正常还原")
+            assertEqual(box3.bad, 0, "无失败")
+            assertEqual(engine.moveCalls.last?.from, "/.MITV-Trash/Movies/a.mp4", "从回收站移回")
+            assertEqual(engine.moveCalls.last?.to, "/Movies/a.mp4", "移回原路径")
+            assertEqual(trash.count, 0, "还原后记录移除")
+        }
+    }
+
+    static func testEmptyTrash() {
+        print("· 清空回收站")
+        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-emptytrash-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let caps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
+                                mkdir: true, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+
+        // 1) 全部成功：逐条 DELE 记账路径，记录清空
+        do {
+            let engine = InlineEngine()
+            let trash = TrashStore(directory: baseDir.appendingPathComponent("e1"))
+            trash.add(TrashStore.Record(id: "r1", trashPath: "/.MITV-Trash/Movies/a.mp4",
+                                        originalPath: "/Movies/a.mp4", name: "a.mp4", sizeBytes: 5, deletedAt: Date()))
+            trash.add(TrashStore.Record(id: "r2", trashPath: "/.MITV-Trash/Movies/b.mp4",
+                                        originalPath: "/Movies/b.mp4", name: "b.mp4", sizeBytes: 7, deletedAt: Date()))
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps }, trashStore: trash)
+            let box = RestoreBox()
+            service.emptyTrash(progress: { _, _, _ in }) { ok, bad in box.set(ok, bad) }
+            waitUntil("清空完成") { box.ok >= 0 }
+            assertEqual(box.ok, 2, "两项全部删除")
+            assertEqual(box.bad, 0, "无失败")
+            assertEqual(engine.deleteCalls.count, 2, "逐条发起 DELE")
+            assertTrue(engine.deleteCalls.contains("/.MITV-Trash/Movies/a.mp4"), "删除记账路径 a")
+            assertTrue(engine.deleteCalls.contains("/.MITV-Trash/Movies/b.mp4"), "删除记账路径 b")
+            assertEqual(trash.count, 0, "成功后记录清空")
+        }
+
+        // 2) 部分失败：失败项记录保留（可重试），成功项移除
+        do {
+            let engine = InlineEngine()
+            engine.failDeletePaths = ["/.MITV-Trash/Movies/b.mp4"]
+            let trash = TrashStore(directory: baseDir.appendingPathComponent("e2"))
+            trash.add(TrashStore.Record(id: "r1", trashPath: "/.MITV-Trash/Movies/a.mp4",
+                                        originalPath: "/Movies/a.mp4", name: "a.mp4", sizeBytes: 5, deletedAt: Date()))
+            trash.add(TrashStore.Record(id: "r2", trashPath: "/.MITV-Trash/Movies/b.mp4",
+                                        originalPath: "/Movies/b.mp4", name: "b.mp4", sizeBytes: 7, deletedAt: Date()))
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps }, trashStore: trash)
+            let box = RestoreBox()
+            service.emptyTrash(progress: { _, _, _ in }) { ok, bad in box.set(ok, bad) }
+            waitUntil("部分失败返回") { box.ok >= 0 }
+            assertEqual(box.ok, 1, "成功一项")
+            assertEqual(box.bad, 1, "失败一项")
+            assertEqual(trash.count, 1, "失败项记录保留")
+            assertEqual(trash.records.first?.id, "r2", "保留的是失败项")
+        }
+
+        // 3) 空回收站：不发起任何引擎调用
+        do {
+            let engine = InlineEngine()
+            let trash = TrashStore(directory: baseDir.appendingPathComponent("e3"))
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps }, trashStore: trash)
+            let box = RestoreBox()
+            service.emptyTrash(progress: { _, _, _ in }) { ok, bad in box.set(ok, bad) }
+            waitUntil("空回收站返回") { box.ok >= 0 }
+            assertEqual(box.ok, 0, "空回收站 0 删除")
+            assertEqual(box.bad, 0, "空回收站 0 失败")
+            assertEqual(engine.deleteCalls.count, 0, "空回收站不发起 DELE")
+        }
+    }
+}
+
+// MARK: - 批量暂停必须取消引擎句柄（否则「暂停」是假的：传输继续跑完）
+
+extension ServiceTests_B {
+
+    static func testPauseAllCancelsHandles() {
+        print("· 批量暂停取消句柄")
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-pauseall-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let f1 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-pauseall-\(UUID().uuidString).mp4")
+        try? Data(repeating: 0, count: 10).write(to: f1)
+        defer { try? FileManager.default.removeItem(at: f1) }
+
+        let engine = InlineEngine()
+        engine.hangUploads = true
+        let caps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
+                                mkdir: false, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+        let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                 capabilitiesProvider: { caps }, persistenceDirectory: dir,
+                                 concurrency: 2, resumeOnStart: true)
+        queue.addUploads([f1])
+        waitUntil("起传") { queue.snapshot().first?.phase == .running }
+        let id = queue.snapshot().first!.id
+
+        // 全部暂停 → 引擎句柄必须被取消
+        queue.pauseAllByUser()
+        waitUntil("全部暂停生效") { queue.snapshot().first?.phase == .paused }
+        assertTrue(engine.uploadHandles.last??.isCanceled == true, "全部暂停取消引擎句柄（传输不再偷跑）")
+
+        // 全部继续 → 新句柄起传；断线自动暂停 → 同样取消
+        queue.resumeAllByUser()
+        waitUntil("恢复起传") { queue.snapshot().first?.phase == .running }
+        assertTrue(engine.uploadHandles.last??.isCanceled == false, "恢复后新句柄未取消")
+        queue.autoPauseForDisconnect()
+        waitUntil("断线暂停生效") { queue.snapshot().first?.phase == .paused }
+        assertTrue(engine.uploadHandles.last??.isCanceled == true, "断线自动暂停也取消引擎句柄")
+        _ = id
+        engine.releaseAllUploads(.failure(EngineError.aborted))
+    }
+}
+
+// MARK: - 批内/跨批命名碰撞（下载大小写 / 上传降级 inflight / 同文件重复拖入）
+
+extension ServiceTests_B {
+
+    static func testBatchNameCollisions() {
+        print("· 批内命名碰撞")
+        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-batch-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let caps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
+                                mkdir: false, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+        let dlDir = baseDir.appendingPathComponent("dl")
+        try? FileManager.default.createDirectory(at: dlDir, withIntermediateDirectories: true)
+
+        // 1) 同批下载 IMG.jpg + img.jpg → 本地目标必须不同（大小写不敏感卷上是同一文件）
+        do {
+            let engine = InlineEngine()
+            engine.hangDownloads = true
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("q1"),
+                                     concurrency: 2, resumeOnStart: true)
+            let items = queue.addDownloads([
+                FTPFileEntry(path: "/a/IMG.jpg", name: "IMG.jpg", isDirectory: false, size: 1),
+                FTPFileEntry(path: "/a/img.jpg", name: "img.jpg", isDirectory: false, size: 1),
+            ], toDirectory: dlDir)
+            assertEqual(items.count, 2, "两项都入队")
+            let a = items[0].localPath.lowercased()
+            let b = items[1].localPath.lowercased()
+            assertTrue(a != b, "同批大小写碰撞 → 本地目标顺延（不写同一文件）")
+            engine.releaseAllDownloads(.success(1))
+        }
+
+        // 2) 跨批下载：IMG.jpg 在传 → img.jpg 新批必须顺延
+        do {
+            let engine = InlineEngine()
+            engine.hangDownloads = true
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("q2"),
+                                     concurrency: 2, resumeOnStart: true)
+            let first = queue.addDownloads([FTPFileEntry(path: "/a/IMG.jpg", name: "IMG.jpg", isDirectory: false, size: 1)],
+                                           toDirectory: dlDir)
+            waitUntil("第一批起传") { queue.snapshot().first?.phase == .running }
+            let second = queue.addDownloads([FTPFileEntry(path: "/a/img.jpg", name: "img.jpg", isDirectory: false, size: 1)],
+                                            toDirectory: dlDir)
+            assertTrue(first[0].localPath.lowercased() != second[0].localPath.lowercased(),
+                       "跨批大小写碰撞 → 顺延（inflight 大小写不敏感）")
+            engine.releaseAllDownloads(.success(1))
+        }
+
+        // 3) 上传降级（LIST 全失败）：两个同名不同内容文件 → 目标名必须不同（inflight 查重）
+        do {
+            let subA = baseDir.appendingPathComponent("A"); let subB = baseDir.appendingPathComponent("B")
+            try? FileManager.default.createDirectory(at: subA, withIntermediateDirectories: true)
+            try? FileManager.default.createDirectory(at: subB, withIntermediateDirectories: true)
+            let fa = subA.appendingPathComponent("同名.mp4"); let fb = subB.appendingPathComponent("同名.mp4")
+            try? Data(repeating: 0xAA, count: 16).write(to: fa)
+            try? Data(repeating: 0xBB, count: 16).write(to: fb)
+            let engine = InlineEngine()
+            engine.failAllLists = true
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("q3"),
+                                     concurrency: 2, resumeOnStart: true)
+            queue.addUploads([fa, fb])
+            waitUntil("两项降级上传完成") { queue.snapshot().filter { $0.phase == .completed }.count == 2 }
+            assertEqual(engine.uploadCalls.count, 2, "两项都上传")
+            let p0 = engine.uploadCalls[0].remotePath.lowercased()
+            let p1 = engine.uploadCalls[1].remotePath.lowercased()
+            assertTrue(p0 != p1, "降级路径同名 → inflight 查重顺延（不并发 STOR 同一目标）")
+            assertFalse(engine.uploadCalls[0].resume, "降级禁 APPE（0）")
+            assertFalse(engine.uploadCalls[1].resume, "降级禁 APPE（1）")
+        }
+
+        // 4) 同一本地文件同批拖两次 → 第二份收敛为跳过，不传副本
+        do {
+            let f1 = baseDir.appendingPathComponent("double.mp4")
+            try? Data(repeating: 0xCC, count: 16).write(to: f1)
+            let engine = InlineEngine()
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("q4"),
+                                     concurrency: 1, resumeOnStart: true)
+            queue.addUploads([f1, f1])
+            waitUntil("两项都终结") { queue.snapshot().filter { $0.phase == .completed }.count == 2 }
+            assertEqual(engine.uploadCalls.count, 1, "同文件重复拖入只传一次")
+            assertTrue(queue.snapshot().contains { $0.skippedReason != nil }, "第二份标记跳过")
         }
     }
 }

@@ -180,7 +180,7 @@ final class MockEngine: TransferEngine {
                 return
             }
             // Mock：立即写盘（内容为可重复的伪随机块），一次最终进度
-            let data = MockEngine.sampleData(size: Int(min(size, 64 * 1024 * 1024)), seed: abs(remotePath.hashValue))
+            let data = MockEngine.sampleData(size: Int(min(size, 64 * 1024 * 1024)), seed: Int(truncatingIfNeeded: remotePath.hashValue))
             do {
                 if size <= 64 * 1024 * 1024 {
                     try data.write(to: localURL)
@@ -340,7 +340,7 @@ final class MockEngine: TransferEngine {
             if let src = source {
                 data = FileDigest.readPrefix(at: URL(fileURLWithPath: src), maxBytes: Int64(want))
             } else {
-                data = MockEngine.sampleData(size: want, seed: abs(remotePath.hashValue))
+                data = MockEngine.sampleData(size: want, seed: Int(truncatingIfNeeded: remotePath.hashValue))
             }
             DispatchQueue.main.async {
                 if let d = data { completion(.success(d)) }

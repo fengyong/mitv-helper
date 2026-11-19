@@ -172,11 +172,15 @@ final class FTPControlConnection {
         }
     }
 
-    /// 礼貌收尾：QUIT + 关闭（任何错误都忽略）
+    /// 礼貌收尾：QUIT + 关闭（任何错误都忽略）。
+    /// 发送失败（连接已死）不再等响应——旧实现在死连接上 readReply 干等满 ioTimeout（15s），
+    /// 每次失败传输的收尾都白卡 15 秒；QUIT 响应也只需短超时。
     func quit() {
         if sock != nil {
-            try? send("QUIT")
-            _ = try? readReply()
+            if (try? send("QUIT")) != nil {
+                sock?.setReadTimeout(2)
+                _ = try? readReply()
+            }
         }
         close()
     }
@@ -321,12 +325,14 @@ final class FTPControlConnection {
     /// LIST / MLSD 原始行（读到数据连接 EOF 为止）
     func retrieveListing(cmd: String, path: String) throws -> [String] {
         let d = try openDataConnection()
+        var accepted = false
         do {
             try send(cmd, arg: path)
             let r = try readReply()
             guard r.code == 150 || r.code == 125 else {
                 throw FTPErrorMapper.map(code: r.code, text: r.text, op: .list, cmd: cmd)
             }
+            accepted = true
             var acc = [UInt8]()
             var chunk = [UInt8](repeating: 0, count: 65536)
             while true {
@@ -342,6 +348,14 @@ final class FTPControlConnection {
             return FTPControlConnection.splitLines(acc, encoding: config.encoding)
         } catch {
             d.closeNow()
+            // 命令已被接受（150）但中途失败：服务器还会发 226/426 收尾响应。
+            // 不吸收掉这条残留响应，同一连接上的下一条命令（如 MLSD→LIST 回退）
+            // 会把它当成自己的应答，整个控制通道从此错位。
+            if accepted {
+                sock?.setReadTimeout(2)
+                _ = try? readReply()
+                sock?.setReadTimeout(config.ioTimeout)
+            }
             throw error
         }
     }

@@ -36,6 +36,7 @@ final class QueueService {
     private var hold: HoldReason = .none
     private var lastPersistAt = Date.distantPast
     private var notifyPending = false
+    private var notifyDirty = false
     private let persistInterval: TimeInterval = 0.5
 
     // MARK: Init / 持久化恢复
@@ -129,7 +130,9 @@ final class QueueService {
         // 先按「本批 + 磁盘已有」预去重构造；最终唯一化在 stateQ 内并入队列级 inflight（跨批次重名，review D6）
         var created: [QueueItem] = entries.compactMap { entry in
             guard !entry.isDirectory else { return nil }
-            var unique = NameCodec.uniqued(entry.name, existing: usedNames)
+            // 大小写不敏感：本地卷（APFS 默认）与电视 U 盘（FAT）都把 IMG.jpg/img.jpg 当同一文件，
+            // 批内敏感去重会让两项写同一个本地文件（截断式下载互相毁掉）
+            var unique = NameCodec.uniqued(entry.name, existing: usedNames, caseInsensitive: true)
             if fm.fileExists(atPath: dir.appendingPathComponent(unique).path) {
                 var i = 2
                 let stem = (unique as NSString).deletingPathExtension
@@ -151,9 +154,10 @@ final class QueueService {
         guard !created.isEmpty else { return [] }
         stateQ.sync {
             // 跨批次互斥：未终结下载项已占用的本地路径不可复用（截断式下载会互相毁掉）
-            let inflight = Set(items.filter { $0.direction == .download && !$0.phase.isTerminal }.map { $0.localPath })
+            // 大小写不敏感比较：IMG.jpg 在传时，img.jpg 新批次必须顺延
+            let inflight = Set(items.filter { $0.direction == .download && !$0.phase.isTerminal }.map { $0.localPath.lowercased() })
             for i in created.indices {
-                if inflight.contains(created[i].localPath) {
+                if inflight.contains(created[i].localPath.lowercased()) {
                     var unique = (created[i].localPath as NSString).lastPathComponent
                     var k = 2
                     let stem = (unique as NSString).deletingPathExtension
@@ -161,7 +165,7 @@ final class QueueService {
                     while true {
                         let next = ext.isEmpty ? "\(stem) (\(k))" : "\(stem) (\(k)).\(ext)"
                         let cand = dir.appendingPathComponent(next).path
-                        if !inflight.contains(cand) && !fm.fileExists(atPath: cand) {
+                        if !inflight.contains(cand.lowercased()) && !fm.fileExists(atPath: cand) {
                             unique = next
                             created[i].localPath = cand
                             break
@@ -189,7 +193,10 @@ final class QueueService {
         stateQ.sync {
             hold = .user
             for i in items.indices where items[i].isBusy {
+                let before = items[i].phase
                 items[i] = QueueStateMachine.apply(.userPause, to: items[i])
+                // 与单项暂停一致：真正取消引擎传输，否则「暂停」后传输继续跑完、下载继续写盘
+                if items[i].phase != before { handles[items[i].id]?.cancel() }
             }
             persistLocked(force: true)
             notifyChange()
@@ -216,7 +223,10 @@ final class QueueService {
             guard hold != .disconnected else { return }
             hold = .disconnected
             for i in items.indices where items[i].isBusy {
+                let before = items[i].phase
                 items[i] = QueueStateMachine.apply(.autoPause, to: items[i])
+                // 取消引擎句柄：死连接上的传输只会空耗到超时，取消后重连走干净的续传
+                if items[i].phase != before { handles[items[i].id]?.cancel() }
             }
             persistLocked(force: true)
             notifyChange()
@@ -393,12 +403,9 @@ final class QueueService {
             }
             return
         }
-        // 并发互斥：其他未终结上传项已占用的远端名也计入（各项回调在 stateQ 串行处理，无竞态）
-        let inflight = Set(items.compactMap { other -> String? in
-            guard other.id != id, other.direction == .upload, !other.phase.isTerminal,
-                  let p = other.remotePath else { return nil }
-            return (p as NSString).lastPathComponent
-        })
+        // 并发互斥：其他未终结上传项在【同一目标目录】已占用的远端名也计入
+        //（各项回调在 stateQ 串行处理，无竞态；跨目录同名不算冲突）
+        let inflight = inflightUploadNames(dir: dir, excluding: id)
         let mapped = NameCodec.remoteName(for: items[idx].displayName)
         // 磁盘上已有同名文件 → 「相同文件」判定（尺寸 → 前 10MB 指纹）
         if let clash = dirList.first(where: { !$0.isDirectory && $0.name.caseInsensitiveCompare(mapped.remote) == .orderedSame }) { // FAT 大小写不敏感
@@ -536,8 +543,16 @@ final class QueueService {
                                       needsMapping: Bool, resume: Bool, handle: TransferHandle) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
         guard items[idx].phase == .connecting else { return }
+        if let dup = completedDuplicatePath(localPath: items[idx].localPath, dir: dir, excluding: id) {
+            skipUploadAsDuplicate(id, dir: dir, remotePath: dup, needsMapping: needsMapping)
+            return
+        }
+        // 降级路径同样要查 inflight：两项同名都降级时，SIZE 探测都返回 nil（盘上还没有），
+        // 不查重就会并发 STOR 同一目标互相毁掉
+        let unique = NameCodec.capped(NameCodec.uniqued(finalName, existing: inflightUploadNames(dir: dir, excluding: id),
+                                       caseInsensitive: true)).name
         items[idx].remoteDir = dir
-        items[idx].remotePath = dir == "/" ? "/" + finalName : dir + "/" + finalName
+        items[idx].remotePath = dir == "/" ? "/" + unique : dir + "/" + unique
         items[idx].needsNameMapping = needsMapping
         startUpload(id, handle: handle, resumeOverride: resume)
     }
@@ -556,13 +571,37 @@ final class QueueService {
         scheduleIfNeeded() // 释放的槽位立刻派给后续排队项（与 applyEngineEvent 的完成路径一致）
     }
 
+    /// 同一目标目录内，其他未终结上传项已占用的远端名（stateQ 上调用）
+    private func inflightUploadNames(dir: String, excluding id: String) -> Set<String> {
+        Set(items.compactMap { other -> String? in
+            guard other.id != id, other.direction == .upload, !other.phase.isTerminal,
+                  other.remoteDir == dir, let p = other.remotePath else { return nil }
+            return (p as NSString).lastPathComponent
+        })
+    }
+
+    /// 同一本地文件被重复拖入：已有【已完成】的同文件同目录项 → 直接收敛为跳过，
+    /// 不再传一份副本（未完成项不收敛——它可能失败，顺延改名更安全）
+    private func completedDuplicatePath(localPath: String, dir: String, excluding id: String) -> String? {
+        items.first { other in
+            other.id != id && other.direction == .upload && other.phase == .completed
+                && other.localPath == localPath && other.remoteDir == dir && other.skippedReason == nil
+                && other.remotePath != nil
+        }?.remotePath
+    }
+
     /// 定名（净化名/指纹名 + 重名顺延）→ 起传
     private func beginUpload(_ id: String, dir: String, remoteName: String, needsMapping: Bool,
                              dirList: [FTPFileEntry], inflight: Set<String>, handle: TransferHandle) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
         guard items[idx].phase == .connecting else { return } // 可能已被暂停/取消
+        if let dup = completedDuplicatePath(localPath: items[idx].localPath, dir: dir, excluding: id) {
+            skipUploadAsDuplicate(id, dir: dir, remotePath: dup, needsMapping: needsMapping)
+            return
+        }
         let allNames = SmartRouting.existingNames(entries: dirList).union(inflight)
-        let unique = NameCodec.uniqued(remoteName, existing: allNames, caseInsensitive: true)
+        // 顺延后缀可能把名字推过 NAME_MAX → 定名后再按 GBK 字节截断
+        let unique = NameCodec.capped(NameCodec.uniqued(remoteName, existing: allNames, caseInsensitive: true)).name
         items[idx].remoteDir = dir
         items[idx].remotePath = dir == "/" ? "/" + unique : dir + "/" + unique
         items[idx].needsNameMapping = needsMapping
@@ -681,11 +720,18 @@ final class QueueService {
         // 批量完成判定必须每次无条件执行（review S2）：若藏在 notifyPending 合并守卫后面，
         // 终态回调与最终进度背靠背到达时 onBatchCompleted 会丢失/延迟（「删除前先下载」依赖它）
         checkBatchCompletions()
+        notifyDirty = true
         guard !notifyPending else { return }
         notifyPending = true
+        notifyDirty = false // 本轮已派发；合并窗口内再来变更会重新置 dirty
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.notifyPending = false
+            // 复位必须在 stateQ（与置位同队列）；主回调期间到达的新变更由 dirty 补发一轮，
+            // 否则「复位前最后一刻的变更」会被合并守卫吞掉，UI 停在旧状态
+            self.stateQ.async {
+                self.notifyPending = false
+                if self.notifyDirty { self.notifyChange() }
+            }
             self.onChanged?()
         }
     }

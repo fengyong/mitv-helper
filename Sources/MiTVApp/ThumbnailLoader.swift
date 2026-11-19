@@ -10,6 +10,11 @@ final class LocalThumbnailLoader {
     private let cache = NSCache<NSString, NSImage>()
     private let inflightLock = NSLock()
     private var inflight = Set<String>()
+    /// 负缓存：解码失败的文件本会话不再重试（队列卡片 1s 定时器会反复请求，
+    /// 不记住失败就反复起 AVAsset 解码，坏文件永远解不出还持续烧 CPU）
+    private var failed = Set<String>()
+    /// 并发上限：网格一屏几十个卡片同时请求时，不限流会起几十个解码线程
+    private let workSemaphore = DispatchSemaphore(value: 2)
 
     /// 同步命中缓存（未命中返回 nil，不触发加载）
     func cached(forPath path: String, kind: MediaKind) -> NSImage? {
@@ -23,7 +28,7 @@ final class LocalThumbnailLoader {
             return
         }
         inflightLock.lock()
-        if inflight.contains(path) {
+        if failed.contains(path) || inflight.contains(path) {
             inflightLock.unlock()
             completion(nil)
             return
@@ -32,8 +37,12 @@ final class LocalThumbnailLoader {
         inflightLock.unlock()
 
         let finish: (NSImage?) -> Void = { [weak self] img in
-            if let img = img { self?.cache.setObject(img, forKey: key) }
             self?.inflightLock.lock()
+            if let img = img {
+                self?.cache.setObject(img, forKey: key)
+            } else {
+                self?.failed.insert(path)
+            }
             self?.inflight.remove(path)
             self?.inflightLock.unlock()
             DispatchQueue.main.async { completion(img) }
@@ -42,11 +51,15 @@ final class LocalThumbnailLoader {
         switch kind {
         case .image:
             DispatchQueue.global(qos: .userInitiated).async {
+                self.workSemaphore.wait()
+                defer { self.workSemaphore.signal() }
                 let img = NSImage(contentsOfFile: path)?.scaled(maxPixel: 200)
                 finish(img)
             }
         case .video:
             DispatchQueue.global(qos: .userInitiated).async {
+                self.workSemaphore.wait()
+                defer { self.workSemaphore.signal() }
                 let asset = AVURLAsset(url: URL(fileURLWithPath: path))
                 let gen = AVAssetImageGenerator(asset: asset)
                 gen.appliesPreferredTrackTransform = true

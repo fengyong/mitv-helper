@@ -39,10 +39,11 @@ enum SoftDeletePolicy {
     }
 
     /// "/Movies/a.mp4" → "Movies"；"/A/B/c.mp4" → "A--B"；"/a.mp4" → ""（根目录文件）
+    /// 扁平化父目录也是文件名（回收站子目录名），同样受 NAME_MAX 约束
     static func flattenParent(ofPath path: String) -> String {
         let comps = path.split(separator: "/").map(String.init)
         guard comps.count >= 2 else { return "" }
-        return comps.dropLast().joined(separator: "--")
+        return NameCodec.capped(comps.dropLast().joined(separator: "--")).name
     }
 
     /// 目录形态回收站路径："/.MITV-Trash/<扁平化父目录>/<原名>"
@@ -54,11 +55,12 @@ enum SoftDeletePolicy {
     }
 
     /// 前缀兜底名：".MITV-Trash--Movies--a.mp4"（根目录文件为 ".MITV-Trash--a.mp4"）
+    /// 前缀 + 父目录 + 原名可能超 NAME_MAX → 按 GBK 字节截断（保留前缀标记）
     static func prefixTrashName(forRemotePath path: String) -> String {
         let name = (path as NSString).lastPathComponent
         let parent = flattenParent(ofPath: path)
-        if parent.isEmpty { return prefixTag + name }
-        return prefixTag + parent + "--" + name
+        let full = parent.isEmpty ? prefixTag + name : prefixTag + parent + "--" + name
+        return NameCodec.capped(full).name
     }
 
     /// 前缀兜底名 → 扁平化父目录（供还原解析）

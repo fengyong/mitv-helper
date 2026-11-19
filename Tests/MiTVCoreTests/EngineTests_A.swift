@@ -80,6 +80,17 @@ enum EngineTests_A {
         assertEqual(odd[0].size ?? -1, 42, "无日期行 size 逆序提取")
         assertEqual(odd[1].name, "bare-name.mkv", "裸文件名行")
 
+        // d/l/b/c/p/s 开头的多词裸文件名：不得被误判为 unix 权限行而截成最后一个词
+        let bareMulti = FTPListParser.parse([
+            "dance party.mp4",
+            "live concert 2024.mkv",
+            "screenshots backup.png",
+        ], parentPath: "/")
+        assertEqual(bareMulti.count, 3, "多词裸名全部保留")
+        assertEqual(bareMulti[0].name, "dance party.mp4", "d 开头多词名不截断")
+        assertEqual(bareMulti[1].name, "live concert 2024.mkv", "l 开头多词名不截断")
+        assertEqual(bareMulti[2].name, "screenshots backup.png", "s 开头多词名不截断")
+
         // 无时间字段（部分嵌入式服务器省略时间/年份）——不得整行丢弃
         let noTime = FTPListParser.parse([
             "-rw-r--r-- 1 u g 42 Nov 18 file.mp4",
@@ -124,6 +135,13 @@ enum EngineTests_A {
         assertEqual(ml[1].size ?? -1, 12345, "MLSD size")
         assertTrue(ml[1].modified != nil, "MLSD modify 时间戳")
         assertFalse(ml[2].isDirectory, "MLSD OS.* 类型按文件兜底")
+        // RFC 3659：modify 是 UTC。20201118103045 → UTC 10 点（按本地时区解释会偏 8 小时）
+        var utcCal = Calendar(identifier: .gregorian)
+        utcCal.timeZone = TimeZone(identifier: "UTC")!
+        let utcComps = utcCal.dateComponents([.year, .month, .day, .hour, .minute], from: ml[1].modified!)
+        assertEqual(utcComps.hour, 10, "MLSD modify 按 UTC 解释（小时）")
+        assertEqual(utcComps.minute, 30, "MLSD modify 按 UTC 解释（分钟）")
+        assertEqual(utcComps.day, 18, "MLSD modify 日期")
 
         // MARK: APPE 续传偏移计算（SIZE 校验 + APPE，REST 不可用）
 

@@ -12,10 +12,12 @@ final class ThumbCacheStore {
 
     private var db: OpaquePointer?
     private let lock = NSLock()
+    private let directory: URL
     /// 记录数上限：超过则按创建时间剪到一半（缩略图文件一并删除）
     private let maxEntries: Int
 
     init(directory: URL, maxEntries: Int = 2000) {
+        self.directory = directory
         self.maxEntries = max(4, maxEntries)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
         let url = directory.appendingPathComponent("thumbs.db")
@@ -65,7 +67,11 @@ final class ThumbCacheStore {
         sqlite3_bind_text(stmt, 4, file, -1, SQLITE_TRANSIENT)
         sqlite3_bind_double(stmt, 5, Date().timeIntervalSince1970)
         sqlite3_step(stmt)
-        pruneLocked()
+        // 剪枝掉的记录对应的缩略图文件必须一并删除，否则磁盘孤儿只增不减
+        let pruned = pruneLocked()
+        for file in pruned {
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(file))
+        }
     }
 
     /// 删除一条记录（缓存文件丢失等场景）；返回被删记录的缩略图文件名

@@ -72,15 +72,18 @@ final class TVFileService {
     private let endpointProvider: () -> FTPEndpoint?
     private let capabilitiesProvider: () -> Capabilities?
     let trashStore: TrashStore
+    private let thumbDirectoryOverride: URL?
 
     init(engineProvider: @escaping () -> TransferEngine,
          endpointProvider: @escaping () -> FTPEndpoint?,
          capabilitiesProvider: @escaping () -> Capabilities?,
-         trashStore: TrashStore) {
+         trashStore: TrashStore,
+         thumbDirectory: URL? = nil) {
         self.engineProvider = engineProvider
         self.endpointProvider = endpointProvider
         self.capabilitiesProvider = capabilitiesProvider
         self.trashStore = trashStore
+        self.thumbDirectoryOverride = thumbDirectory
     }
 
     // MARK: 浏览
@@ -188,6 +191,24 @@ final class TVFileService {
                             endpoint: FTPEndpoint, engine: TransferEngine,
                             progress: @escaping (Int, Int, String) -> Void,
                             completion: @escaping (Result<DeleteOutcome, Error>) -> Void) {
+        // 目标名去重：回收站里可能已有同名旧文件（删→重传→再删）。RNTO 覆盖语义不明，
+        // 直接撞名会静默销毁先删的文件、撤销还原出错误内容 → 先列出回收站目录占用名，撞名顺延。
+        func trashDir(of entry: FTPFileEntry) -> String {
+            switch form {
+            case .directory:
+                let parent = SoftDeletePolicy.flattenParent(ofPath: entry.path)
+                return parent.isEmpty ? SoftDeletePolicy.trashRoot : SoftDeletePolicy.trashRoot + "/" + parent
+            case .prefix:
+                return "/"
+            }
+        }
+        var occupied: [String: Set<String>] = [:]
+        for dir in Set(files.map { trashDir(of: $0) }) {
+            // 本地记账先兜底；远端列表补充孤儿文件（应用数据丢失后残留）
+            occupied[dir] = Set(trashStore.records.filter { ($0.trashPath as NSString).deletingLastPathComponent == dir }
+                .map { ($0.trashPath as NSString).lastPathComponent })
+        }
+        let dirs = Array(occupied.keys)
         var records: [TrashStore.Record] = []
         var failedNames: [String] = []
         let total = files.count
@@ -198,15 +219,19 @@ final class TVFileService {
             }
             let entry = files[i]
             progress(i, total, entry.name)
-            let target: String
+            let dir = trashDir(of: entry)
+            let base: String
             switch form {
             case .directory:
-                target = SoftDeletePolicy.directoryTrashPath(forRemotePath: entry.path)
+                base = (SoftDeletePolicy.directoryTrashPath(forRemotePath: entry.path) as NSString).lastPathComponent
             case .prefix:
-                target = "/" + SoftDeletePolicy.prefixTrashName(forRemotePath: entry.path)
+                base = SoftDeletePolicy.prefixTrashName(forRemotePath: entry.path)
             }
+            let unique = NameCodec.uniqued(base, existing: occupied[dir] ?? [], caseInsensitive: true)
+            let target = dir == "/" ? "/" + unique : dir + "/" + unique
             engine.move(endpoint, from: entry.path, to: target) { error in
                 if error == nil {
+                    occupied[dir, default: []].insert(unique)
                     let record = TrashStore.Record(id: UUID().uuidString,
                                                    trashPath: target,
                                                    originalPath: entry.path,
@@ -222,7 +247,19 @@ final class TVFileService {
                 step(i + 1)
             }
         }
-        step(0)
+        func listNext(_ i: Int) {
+            guard i < dirs.count else { step(0); return }
+            let dir = dirs[i]
+            engine.list(endpoint, path: dir) { result in
+                if case .success(let entries) = result {
+                    let names = entries.filter { !$0.isDirectory }.map { $0.name }
+                    occupied[dir] = (occupied[dir] ?? []).union(names)
+                }
+                // 列表失败不阻断删除：本地记账仍提供去重兜底
+                listNext(i + 1)
+            }
+        }
+        listNext(0)
     }
 
     private func hardDelete(_ files: [FTPFileEntry], endpoint: FTPEndpoint, engine: TransferEngine,
@@ -246,7 +283,8 @@ final class TVFileService {
         step(0)
     }
 
-    /// 撤销：把记录的文件移回原位
+    /// 撤销：把记录的文件移回原位。原路径已被占用（删除后重新上传了同名文件）时跳过该项，
+    /// 绝不覆盖——记录保留在回收站，用户可稍后处理。
     func restore(_ records: [TrashStore.Record],
                  progress: @escaping (_ done: Int, _ total: Int, _ name: String) -> Void,
                  completion: @escaping (_ restoredCount: Int, _ failedCount: Int) -> Void) {
@@ -259,6 +297,11 @@ final class TVFileService {
         var ok = 0
         var bad = 0
         var restoredIds: [String] = []
+        // 预列原目录占用名（每个父目录一次）；列不出的目录保守判失败，不赌覆盖
+        var occupied: [String: Set<String>] = [:]
+        var unlistable = Set<String>()
+        let parents = Set(records.map { ($0.originalPath as NSString).deletingLastPathComponent })
+        let parentList = Array(parents)
         func step(_ i: Int) {
             guard i < total else {
                 trashStore.remove(ids: restoredIds)
@@ -267,10 +310,69 @@ final class TVFileService {
             }
             let record = records[i]
             progress(i, total, record.name)
+            let dir = (record.originalPath as NSString).deletingLastPathComponent
+            let nameKey = ((record.originalPath as NSString).lastPathComponent).lowercased()
+            if unlistable.contains(dir) || (occupied[dir]?.contains(nameKey) == true) {
+                bad += 1
+                progress(i + 1, total, record.name)
+                step(i + 1)
+                return
+            }
             engine.move(endpoint, from: record.trashPath, to: record.originalPath) { error in
                 if error == nil {
                     ok += 1
                     restoredIds.append(record.id)
+                    occupied[dir, default: []].insert(nameKey)
+                } else {
+                    bad += 1
+                }
+                progress(i + 1, total, record.name)
+                step(i + 1)
+            }
+        }
+        func listNext(_ i: Int) {
+            guard i < parentList.count else { step(0); return }
+            let dir = parentList[i]
+            engine.list(endpoint, path: dir) { result in
+                switch result {
+                case .success(let entries):
+                    occupied[dir] = Set(entries.filter { !$0.isDirectory }.map { $0.name.lowercased() })
+                case .failure:
+                    unlistable.insert(dir)
+                }
+                listNext(i + 1)
+            }
+        }
+        listNext(0)
+    }
+
+    /// 清空回收站：永久删除本地记账里的全部文件（不可撤销，UI 必须先确认）。
+    /// 只删有记账的路径——回收站目录里的无主孤儿文件不动，避免误删应用之外的数据。
+    func emptyTrash(progress: @escaping (_ done: Int, _ total: Int, _ name: String) -> Void,
+                    completion: @escaping (_ deletedCount: Int, _ failedCount: Int) -> Void) {
+        let records = trashStore.records
+        guard !records.isEmpty else { completion(0, 0); return }
+        guard let endpoint = endpointProvider() else {
+            completion(0, records.count)
+            return
+        }
+        let engine = engineProvider()
+        let total = records.count
+        var ok = 0
+        var bad = 0
+        var removedIds: [String] = []
+        func step(_ i: Int) {
+            guard i < total else {
+                trashStore.remove(ids: removedIds)
+                completion(ok, bad)
+                return
+            }
+            let record = records[i]
+            progress(i, total, record.name)
+            engine.delete(endpoint, remotePath: record.trashPath) { error in
+                if error == nil {
+                    ok += 1
+                    removedIds.append(record.id)
                 } else {
                     bad += 1
                 }
@@ -291,17 +393,30 @@ final class TVFileService {
     // MARK: 浏览缩略图（远端图片）
 
     private let thumbCache = NSCache<NSString, NSImage>()
-    private var fetchingPaths = Set<String>()
+    /// 排队或传输中的路径 → 等待结果的回调（同路径多次请求共享一次下载）
+    private var thumbPending: [String: [(NSImage?) -> Void]] = [:]
+    private var thumbWaiting: [FTPFileEntry] = []
+    private var thumbActive = 0
+    private var thumbHandles: [String: TransferHandle] = [:]
     private var failedThumbs = Set<String>()
+    /// 被主动取消的路径：收尾时不进负缓存（滚回来还要重新取）
+    private var canceledThumbs = Set<String>()
     private let fetchLock = NSLock()
+    /// 嵌入式 FTP 服务器连接数有限：缩略图下载最多 2 路并发，其余排队
+    private let thumbMaxActive = 2
     private let maxThumbBytes: Int64 = 20 * 1024 * 1024
     /// SQLite 磁盘索引 + 缩略图文件落盘：重启后浏览不再重复下载（用户需求）
     private lazy var thumbStore = ThumbCacheStore(directory: thumbDir)
 
     private var thumbDir: URL {
-        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        let dir = base.appendingPathComponent("MiTVHelper/Thumbs", isDirectory: true)
+        let dir: URL
+        if let override = thumbDirectoryOverride {
+            dir = override
+        } else {
+            let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+                ?? FileManager.default.temporaryDirectory
+            dir = base.appendingPathComponent("MiTVHelper/Thumbs", isDirectory: true)
+        }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: nil)
         return dir
     }
@@ -324,8 +439,8 @@ final class TVFileService {
             return
         }
         // SQLite 磁盘命中（path+size）：重启后免重复下载；缩略图文件丢失则删记录走重新生成
-        let cachedFile = thumbStore.lookup(path: entry.path, size: entry.size ?? -1)
-        if let file = cachedFile {
+        let sizeKey = entry.size ?? -1
+        if let file = thumbStore.lookup(path: entry.path, size: sizeKey) {
             let thumbURL = thumbDir.appendingPathComponent(file)
             if let image = NSImage(contentsOf: thumbURL) {
                 thumbCache.setObject(image, forKey: key)
@@ -335,81 +450,139 @@ final class TVFileService {
             thumbStore.delete(path: entry.path)
             try? FileManager.default.removeItem(at: thumbURL)
         }
-        // 负缓存：失败一次本会话内不再重试（防每次浏览都重下大图）
         fetchLock.lock()
-        if failedThumbs.contains(entry.path) || fetchingPaths.contains(entry.path) {
+        // 负缓存：失败一次本会话内不再重试（防每次浏览都重下大图）
+        if failedThumbs.contains(entry.path) {
             fetchLock.unlock()
             completion(nil)
             return
         }
-        fetchingPaths.insert(entry.path)
+        if thumbPending[entry.path] != nil {
+            thumbPending[entry.path]?.append(completion)
+            fetchLock.unlock()
+            return
+        }
+        thumbPending[entry.path] = [completion]
+        thumbWaiting.append(entry)
+        fetchLock.unlock()
+        pumpThumbs()
+    }
+
+    /// 单元格复用/滚出视野：取消该路径的缩略图获取（排队中的直接丢弃，传输中的断连接）
+    func cancelThumbnail(forPath path: String) {
+        guard !path.isEmpty else { return }
+        fetchLock.lock()
+        if let i = thumbWaiting.firstIndex(where: { $0.path == path }) {
+            thumbWaiting.remove(at: i)
+            let cbs = thumbPending.removeValue(forKey: path) ?? []
+            fetchLock.unlock()
+            DispatchQueue.main.async { for cb in cbs { cb(nil) } }
+            return
+        }
+        if thumbPending[path] != nil {
+            canceledThumbs.insert(path)
+        }
+        let handle = thumbHandles[path]
+        fetchLock.unlock()
+        handle?.cancel()
+    }
+
+    private func pumpThumbs() {
+        fetchLock.lock()
+        while thumbActive < thumbMaxActive, !thumbWaiting.isEmpty {
+            let entry = thumbWaiting.removeFirst()
+            thumbActive += 1
+            fetchLock.unlock()
+            startThumbFetch(entry)
+            fetchLock.lock()
+        }
+        fetchLock.unlock()
+    }
+
+    private func startThumbFetch(_ entry: FTPFileEntry) {
+        fetchLock.lock()
+        if canceledThumbs.remove(entry.path) != nil {
+            // 排队→起传的间隙里被取消：直接收尾，不起连接
+            let cbs = thumbPending.removeValue(forKey: entry.path) ?? []
+            thumbActive -= 1
+            fetchLock.unlock()
+            DispatchQueue.main.async { for cb in cbs { cb(nil) } }
+            DispatchQueue.global().async { [weak self] in self?.pumpThumbs() }
+            return
+        }
         fetchLock.unlock()
 
+        let key = entry.path as NSString
         // 缓存文件名用路径哈希：中文长路径的 percent-encoding 可超 NAME_MAX=255 导致永不落盘（review D7）
         // orig- 前缀：原图/前缀临时文件——与缩略图持久文件（md5.jpg）区分，防 finish 收尾误删缩略图
         let ext = (entry.name as NSString).pathExtension
         let hashed = FileDigest.md5Hex(Data(entry.path.utf8)) + (ext.isEmpty ? "" : "." + ext)
         let localURL = thumbDir.appendingPathComponent("orig-" + hashed)
-        guard let endpoint = endpointProvider() else {
-            markNotFetching(entry.path); completion(nil); return
-        }
-        // 生成成功：缩略图 JPEG 落盘 + 记录入 SQLite（digest=原文件/前缀文件的 md5，供内容寻址扩展）
-        let localSize = entry.size ?? 0
+        let sizeKey = entry.size ?? -1
+        // 生成成功：缩略图 JPEG 落盘 + 记录入 SQLite（在后台队列执行，见 finish 调用点）
         let persist: (NSImage) -> Void = { [weak self] img in
             guard let self = self else { return }
             let thumbFile = FileDigest.md5Hex(Data(entry.path.utf8)) + ".jpg"
             if let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
                let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) {
                 try? jpeg.write(to: self.thumbDir.appendingPathComponent(thumbFile))
-                let digest = FileDigest.fingerprint(url: localURL, fileSize: min(localSize, FileDigest.prefixLimit))?.hex
-                self.thumbStore.store(path: entry.path, size: entry.size ?? localSize, digest: digest, file: thumbFile)
+                let digest = FileDigest.fingerprint(url: localURL,
+                                                    fileSize: min(max(0, entry.size ?? 0), FileDigest.prefixLimit))?.hex
+                self.thumbStore.store(path: entry.path, size: sizeKey, digest: digest, file: thumbFile)
             }
         }
         let finish: (NSImage?) -> Void = { [weak self] img in
             guard let self = self else { return }
-            self.markNotFetching(entry.path)
+            self.fetchLock.lock()
+            let cbs = self.thumbPending.removeValue(forKey: entry.path) ?? []
+            self.thumbHandles.removeValue(forKey: entry.path)
+            let canceled = self.canceledThumbs.remove(entry.path) != nil
+            if img == nil && !canceled { self.failedThumbs.insert(entry.path) }
+            self.thumbActive -= 1
+            self.fetchLock.unlock()
             if let img = img {
                 self.thumbCache.setObject(img, forKey: key)
                 persist(img)
-            } else {
-                self.fetchLock.lock()
-                self.failedThumbs.insert(entry.path)
-                self.fetchLock.unlock()
             }
             try? FileManager.default.removeItem(at: localURL)
-            DispatchQueue.main.async { completion(img) }
+            DispatchQueue.main.async { for cb in cbs { cb(img) } }
+            self.pumpThumbs()
+        }
+        guard let endpoint = endpointProvider() else {
+            DispatchQueue.global().async { finish(nil) }
+            return
         }
         if entry.kind == .video {
             // 视频：读前 2MB 试帧（本机 AVAsset 能解就出首帧；moov 在尾部解不出 → nil 兜底）
-            engineProvider().downloadPrefix(endpoint, remotePath: entry.path, maxBytes: 2 * 1024 * 1024) { [weak self] result in
-                guard let self = self else { return }
-                switch result {
-                case .failure:
-                    finish(nil)
-                case .success(let data):
-                    try? data.write(to: localURL)
-                    let image = Self.firstFrame(from: localURL)?.scaled(maxPixel: 400) ?? nil
-                    finish(image)
+            engineProvider().downloadPrefix(endpoint, remotePath: entry.path, maxBytes: 2 * 1024 * 1024) { result in
+                // 引擎回调在主队列：写盘/解码都是重活，hop 后台再收尾
+                DispatchQueue.global(qos: .userInitiated).async {
+                    switch result {
+                    case .failure:
+                        finish(nil)
+                    case .success(let data):
+                        try? data.write(to: localURL)
+                        finish(Self.firstFrame(from: localURL)?.scaled(maxPixel: 400))
+                    }
                 }
             }
             return
         }
-        engineProvider().download(endpoint, remotePath: entry.path, to: localURL,
-                                  handle: nil, onProgress: nil) { [weak self] result in
-            guard let self = self else { return }
-            // 统一走 finish：落盘 + 入 SQLite（此前图片分支旧内联尾部绕过 finish → 永不入库）
-            guard case .success = result, let image = NSImage(contentsOf: localURL) else {
-                finish(nil)
-                return
-            }
-            finish(image.scaled(maxPixel: 400) ?? image)
-        }
-    }
-
-    private func markNotFetching(_ path: String) {
+        let handle = TransferHandle()
         fetchLock.lock()
-        fetchingPaths.remove(path)
+        thumbHandles[entry.path] = handle
         fetchLock.unlock()
+        engineProvider().download(endpoint, remotePath: entry.path, to: localURL,
+                                  handle: handle, onProgress: nil) { result in
+            // 引擎回调在主队列：整图解码 + 缩放 + JPEG 落盘 + 指纹都在后台做
+            DispatchQueue.global(qos: .userInitiated).async {
+                guard case .success = result, let image = NSImage(contentsOf: localURL) else {
+                    finish(nil)
+                    return
+                }
+                finish(image.scaled(maxPixel: 400) ?? image)
+            }
+        }
     }
 
     /// 视频文件首帧（AVAssetImageGenerator；无法解码返回 nil）
@@ -433,16 +606,21 @@ extension FTPFileEntry {
 
 extension NSImage {
     /// 等比缩到 maxPixel 内（供网格缩略）。from 必须传 .zero（整图）——传固定矩形会变成裁切。
+    /// 用 CGContext 离屏绘制：lockFocus 依赖 AppKit 图形上下文，后台队列调用不安全，
+    /// 而缩略图缩放恰恰都在后台队列发生。
     func scaled(maxPixel: CGFloat) -> NSImage? {
         let ratio = min(maxPixel / max(size.width, 1), maxPixel / max(size.height, 1), 1)
         let target = NSSize(width: size.width * ratio, height: size.height * ratio)
         guard target.width > 1, target.height > 1 else { return nil }
-        let img = NSImage(size: target)
-        img.lockFocus()
-        draw(in: NSRect(origin: .zero, size: target),
-             from: .zero,
-             operation: .copy, fraction: 1.0)
-        img.unlockFocus()
+        guard let src = cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let w = Int(target.width.rounded()), h = Int(target.height.rounded())
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(src, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let out = ctx.makeImage() else { return nil }
+        let img = NSImage(cgImage: out, size: target)
         img.isTemplate = false
         return img
     }

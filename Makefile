@@ -18,7 +18,7 @@ TESTS  := $(wildcard Tests/MiTVCoreTests/*.swift)
 APP_SERVICE := Sources/MiTVApp/QueueModel.swift Sources/MiTVApp/QueueService.swift \
                Sources/MiTVApp/SmartRouting.swift Sources/MiTVApp/SoftDeletePolicy.swift \
                Sources/MiTVApp/BrowseFilter.swift Sources/MiTVApp/ThumbCacheStore.swift \
-               Sources/MiTVApp/TVStore.swift
+               Sources/MiTVApp/TVStore.swift Sources/MiTVApp/TVFileService.swift
 
 .PHONY: all app cli test appbundle clean typecheck
 
@@ -46,7 +46,7 @@ test: build/test-runner
 
 build/test-runner: $(CORE) $(ENGINE) $(TESTS) $(APP_SERVICE)
 	@mkdir -p build
-	$(SWIFT) $(FLAGS) -module-name MiTVTests $(CORE) $(ENGINE) $(TESTS) $(APP_SERVICE) -framework Foundation -o $@
+	$(SWIFT) $(FLAGS) -module-name MiTVTests $(CORE) $(ENGINE) $(TESTS) $(APP_SERVICE) -framework Foundation -framework AppKit -framework AVFoundation -o $@
 
 # 快速类型检查（不产出二进制，CI 心跳用）
 typecheck:

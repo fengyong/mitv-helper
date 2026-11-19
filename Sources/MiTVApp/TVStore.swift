@@ -27,12 +27,18 @@ final class TVStore {
 
     private let fileURL: URL
     private let lock = NSLock()
-    private(set) var state: TVPersistState
+    private var _state: TVPersistState
+
+    /// 线程安全快照：后台（心跳/队列 provider）与主线程都会读，写经 update() 加锁
+    var state: TVPersistState {
+        lock.lock(); defer { lock.unlock() }
+        return _state
+    }
 
     init(directory: URL = TVStore.defaultDirectory()) {
         fileURL = directory.appendingPathComponent("tv.json")
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
-        state = TVStore.load(from: fileURL) ?? TVPersistState()
+        _state = TVStore.load(from: fileURL) ?? TVPersistState()
     }
 
     var endpoint: FTPEndpoint? { state.endpoint }
@@ -40,8 +46,8 @@ final class TVStore {
 
     func update(_ mutate: (inout TVPersistState) -> Void) {
         lock.lock()
-        mutate(&state)
-        let snapshot = state
+        mutate(&_state)
+        let snapshot = _state
         TVStore.persist(snapshot, to: fileURL)
         lock.unlock()
     }
