@@ -67,17 +67,73 @@ final class RootDropView: NSView {
     }
 }
 
-// MARK: - 顶栏（状态胶囊 + 导航按钮）
+/// 存放位置 chip：常驻显示当前模式（智能分类 / 存到：末级目录名），点击打开选择器
+/// （设计稿 docs/20261119_design_upload_target.md v2 §5.1；D4：显示末级名 + tooltip 全路径）
+final class LocationChip: NSView {
+
+    var onTap: (() -> Void)?
+    private let iconView = NSImageView()
+    private let text = UIUtil.label("", size: 12, weight: .medium, color: .secondaryLabelColor)
+    private let chevron = UIUtil.label("▾", size: 9, color: .tertiaryLabelColor)
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 12
+        layer?.backgroundColor = NSColor.quaternaryLabelColor.withAlphaComponent(0.25).cgColor
+        iconView.image = Icons.folder
+        iconView.contentTintColor = .secondaryLabelColor
+        for v in [iconView, text, chevron] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 24),
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 9),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 14),
+            iconView.heightAnchor.constraint(equalToConstant: 14),
+            text.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 5),
+            text.centerYAnchor.constraint(equalTo: centerYAnchor),
+            chevron.leadingAnchor.constraint(equalTo: text.trailingAnchor, constant: 4),
+            chevron.centerYAnchor.constraint(equalTo: centerYAnchor),
+            chevron.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+        ])
+        let click = NSClickGestureRecognizer(target: self, action: #selector(tapped))
+        addGestureRecognizer(click)
+        setTarget(nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("不支持") }
+
+    @objc private func tapped() { onTap?() }
+
+    /// dir = nil 显示智能分类；指定位置显示末级目录名，tooltip 展示完整层级
+    func setTarget(_ dir: String?) {
+        if let dir = dir {
+            let name = (dir as NSString).lastPathComponent
+            text.stringValue = "存到：\(name.isEmpty ? "电视根目录" : name)"
+            toolTip = dir == "/" ? "电视根目录" : String(dir.dropFirst())
+        } else {
+            text.stringValue = "存放位置：智能分类"
+            toolTip = "视频进 Movies 文件夹，照片进 Pictures 文件夹，其他放根目录"
+        }
+    }
+}
+
+// MARK: - 顶栏（状态胶囊 + 存放位置 chip + 导航按钮）
 
 final class HeaderBar: NSView {
 
     enum Nav: Int { case photos = 0, videos = 1, tv = 2 }
 
     let capsule = StatusCapsule()
+    let locationChip = LocationChip()
     private(set) var navButtons: [NSButton] = []
     private var settingsButton: NSButton!
     var onNav: ((Nav) -> Void)?
     var onCapsuleTap: (() -> Void)?
+    var onLocationTap: (() -> Void)?
     var onSettingsTap: (() -> Void)?
 
     init() {
@@ -100,6 +156,10 @@ final class HeaderBar: NSView {
         capsule.translatesAutoresizingMaskIntoConstraints = false
         capsule.onTap = { [weak self] in self?.onCapsuleTap?() }
         addSubview(capsule)
+
+        locationChip.translatesAutoresizingMaskIntoConstraints = false
+        locationChip.onTap = { [weak self] in self?.onLocationTap?() }
+        addSubview(locationChip)
 
         let titles: [(String, NSImage, Nav)] = [
             ("照片", Icons.photo, .photos),
@@ -142,6 +202,9 @@ final class HeaderBar: NSView {
 
             capsule.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
             capsule.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            locationChip.leadingAnchor.constraint(equalTo: capsule.trailingAnchor, constant: 10),
+            locationChip.centerYAnchor.constraint(equalTo: centerYAnchor),
 
             settingsButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             settingsButton.centerYAnchor.constraint(equalTo: centerYAnchor),

@@ -50,6 +50,7 @@ final class AppCoordinator: NSObject {
     private var connecting = false
     private var yellowBannerUp = false
     private var photoPicker: PhotoPickerController?
+    private var locationPicker: DirPickerController?
     private var onboarding: OnboardingOverlay?
     var confirmOverlay: ConfirmOverlay? // 冒烟自动化需要访问；正常流程不受影响
     private var settingsController: SettingsController?
@@ -100,6 +101,7 @@ final class AppCoordinator: NSObject {
         assembleWindow()
         header.onNav = { [weak self] nav in self?.handleNav(nav) }
         header.onCapsuleTap = { [weak self] in self?.capsuleTapped() }
+        header.onLocationTap = { [weak self] in self?.openLocationPicker() }
         header.onSettingsTap = { [weak self] in self?.openSettings() }
     }
 
@@ -175,6 +177,12 @@ final class AppCoordinator: NSObject {
         queue.onBatchCompleted = { [weak self] batchId, ok, bad in
             self?.handleBatchCompleted(batchId: batchId, ok: ok, bad: bad)
         }
+        // 存放位置（设计稿 v2 §6.1/§6.3）：全局指定目录注入队列；失效降级回根目录后告知（D6，
+        // 每批至多一次由 QueueService 去重）
+        queue.targetDirProvider = { [weak self] in self?.store.state.customUploadDir }
+        queue.onUploadFallback = { [weak self] _, _ in
+            self?.showToast("指定的位置已不在电视上，文件已放到电视根目录")
+        }
         loadPendingDeletes()
         heartbeat.onStatus = { [weak self] status in self?.handleHeartbeat(status) }
 
@@ -227,6 +235,11 @@ final class AppCoordinator: NSObject {
         if auto == "picker" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 self?.openPhotoPicker()
+            }
+        }
+        if auto == "location" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.openLocationPicker()
             }
         }
         if auto == "settings" {
@@ -465,6 +478,7 @@ final class AppCoordinator: NSObject {
         case .off:
             header.capsule.setLook(.off, store.endpoint == nil ? "未连接电视 · 点此连接" : "\(name) · 连接不上 · 点此重连")
         }
+        header.locationChip.setTarget(store.state.customUploadDir)
         if mode == .browser, heartbeatStatus == .off, store.endpoint != nil {
             // 掉线时浏览态停留但列表不可操作（由浏览器自己展示空态）
         }
@@ -501,6 +515,7 @@ final class AppCoordinator: NSObject {
         }
         if result.ignored > 0 { showToast("已忽略 \(result.ignored) 个不支持的项目") }
         queue.addUploads(result.media)
+        announceTargetIfCustom(count: result.media.count)
         setMode(.home)
     }
 
@@ -508,7 +523,53 @@ final class AppCoordinator: NSObject {
     func enqueueStaged(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
         queue.addUploads(urls)
+        announceTargetIfCustom(count: urls.count)
         setMode(.home)
+    }
+
+    // MARK: - 存放位置（chip 与设置页共用入口，设计稿 v2 §5.1/§5.5/D7）
+
+    /// 打开「选择存放位置」弹窗。未连接拦截（设计稿 §6.4）
+    func openLocationPicker() {
+        guard store.endpoint != nil, store.state.onboardingDone else {
+            showToast("先连接电视才能选择存放位置")
+            return
+        }
+        guard locationPicker == nil else { return }
+        let picker = DirPickerController(coordinator: self)
+        picker.onPicked = { [weak self] dir in
+            guard let self = self else { return }
+            self.locationPicker = nil
+            self.applyUploadTarget(dir)
+        }
+        picker.onClose = { [weak self] in self?.locationPicker = nil }
+        locationPicker = picker
+        picker.present(asSheetOf: window)
+    }
+
+    /// 应用选择结果并刷新 chip：nil = 恢复智能分类；非 nil = 指定目录（记录最近使用供快切）
+    func applyUploadTarget(_ dir: String?) {
+        if let dir = dir {
+            store.setUploadTarget(dir)
+            store.recordRecentUploadDir(dir)
+            showToast("已指定存放位置：\(targetDisplayPath(dir))")
+        } else {
+            store.setUploadTarget(nil)
+            showToast("已恢复智能分类")
+        }
+        refreshHeader()
+    }
+
+    /// 界面显示名：去开头斜杠的完整层级（与队列卡片同源）；根目录叫「电视根目录」
+    func targetDisplayPath(_ dir: String) -> String {
+        dir == "/" ? "电视根目录" : String(dir.dropFirst())
+    }
+
+    /// 指定模式入队落点提示（设计稿 v2 §6.2/D3）：全局指定模式是常驻隐藏状态，chip 可见 ≠ 后果可见，
+    /// 动作时刻报落点消除「照片悄悄进了电视剧目录」式惊讶；智能分类维持现状不加噪
+    private func announceTargetIfCustom(count: Int) {
+        guard let dir = store.state.customUploadDir else { return }
+        showToast("\(count) 个文件即将存到 \(targetDisplayPath(dir))")
     }
 
     private func handleBatchCompleted(batchId: String, ok: Int, bad: Int) {
@@ -593,6 +654,7 @@ final class AppCoordinator: NSObject {
             guard let self = self else { return }
             if !media.isEmpty {
                 self.queue.addUploads(media)
+                self.announceTargetIfCustom(count: media.count)
                 self.setMode(.home)
             }
             if ignored > 0 { self.showToast("已忽略 \(ignored) 个不支持的项目") }
