@@ -36,6 +36,9 @@ app: build/MiTVApp
 
 build/MiTVApp: $(CORE) $(ENGINE) $(APP)
 	@mkdir -p build
+	@n=$$(( $$(sed -n 's/.*appBuildNumber = \([0-9]*\).*/\1/p' Sources/MiTVApp/BuildInfo.swift) + 1 )); \
+	  sed -i '' -E "s/appBuildNumber = [0-9]+/appBuildNumber = $$n/" Sources/MiTVApp/BuildInfo.swift; \
+	  echo "── 构建号 build #$$n ──"
 	$(SWIFT) $(FLAGS) -module-name MiTVApp $(CORE) $(ENGINE) $(APP) \
 	  -framework AppKit -framework AVFoundation -framework Photos -framework Network -o $@
 

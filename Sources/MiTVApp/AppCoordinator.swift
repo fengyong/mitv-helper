@@ -181,12 +181,11 @@ final class AppCoordinator: NSObject {
         showState(emptyView)
         showWindow()
         refreshHeader()
+        updateStatusBar() // 启动即渲染状态栏（构建号从首帧可见，不等连接完成）
 
         if let endpoint = store.endpoint, store.state.onboardingDone {
-            FileHandle.standardError.write(Data("[diag] startup connect → \(endpoint.display)\n".utf8))
             connect(endpoint: endpoint, silent: true)
         } else {
-            FileHandle.standardError.write(Data("[diag] startup → onboarding (endpoint=\(store.endpoint?.display ?? "nil"), done=\(store.state.onboardingDone))\n".utf8))
             showOnboarding()
         }
         if queue.snapshot().isEmpty == false {
@@ -268,13 +267,11 @@ final class AppCoordinator: NSObject {
     private func writeSnapshot(to path: String) {
         if let content = window.contentView, let png = Self.renderPNG(view: content) {
             try? png.write(to: URL(fileURLWithPath: path))
-            NSLog("MITV-SNAPSHOT written: %@", path)
         }
         for w in NSApp.windows where w.sheetParent === window {
             guard let content = w.contentView, let png = Self.renderPNG(view: content) else { continue }
             let sheetPath = path + ".sheet.png"
             try? png.write(to: URL(fileURLWithPath: sheetPath))
-            NSLog("MITV-SNAPSHOT sheet written: %@", sheetPath)
         }
     }
 
@@ -379,19 +376,22 @@ final class AppCoordinator: NSObject {
         let busy = items.filter { $0.phase == .connecting || $0.phase == .running }
         let queued = items.filter { $0.phase == .queued }
         let speed = busy.reduce(0.0) { $0 + $1.bytesPerSecond }
+        // 状态栏右侧常显构建号，一眼确认当前运行的是哪次 build
+        let buildTag = "build \(appBuildNumber)"
+        let right = queued.isEmpty ? buildTag : "\(buildTag) · 排队 \(queued.count) 项"
         if !busy.isEmpty {
             let totalLeft = busy.reduce(Int64(0)) { $0 + max(0, ($1.sizeBytes - $1.bytes)) }
             let ups = busy.filter { $0.direction == .upload }.count
             let verb = ups == busy.count ? "正在发送" : (ups == 0 ? "正在取回" : "正在传输")
             var text = "\(verb) \(busy.count) 项"
             if let eta = Fmt.eta(totalLeft, bps: speed) { text += " · \(eta)" }
-            statusBar.set(left: text, right: queued.isEmpty ? nil : "排队 \(queued.count) 项")
+            statusBar.set(left: text, right: right)
         } else if heartbeatStatus == .connected {
-            statusBar.set(left: "就绪 · 电视已连接", right: nil)
+            statusBar.set(left: "就绪 · 电视已连接", right: right)
         } else if case .lost = heartbeatStatus {
-            statusBar.set(left: "电视连接不上 · 正在等待重连", right: nil)
+            statusBar.set(left: "电视连接不上 · 正在等待重连", right: right)
         } else {
-            statusBar.set(left: "就绪", right: nil)
+            statusBar.set(left: "就绪", right: right)
         }
     }
 
@@ -407,7 +407,6 @@ final class AppCoordinator: NSObject {
             self.connecting = false
             switch result {
             case .success(let caps):
-                FileHandle.standardError.write(Data("[diag] probe OK: dele=\(caps.deleteFile) rename=\(caps.rename)\n".utf8))
                 self.store.update {
                     $0.endpoint = endpoint
                     $0.capabilities = caps
@@ -426,7 +425,6 @@ final class AppCoordinator: NSObject {
                 }
                 completion?(true, nil)
             case .failure(let error):
-                FileHandle.standardError.write(Data("[diag] probe FAIL: \(error.localizedDescription)\n".utf8))
                 self.heartbeatStatus = .off
                 self.refreshHeader()
                 completion?(false, error.localizedDescription)

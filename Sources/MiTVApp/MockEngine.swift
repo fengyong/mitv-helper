@@ -404,7 +404,6 @@ final class EngineHolder {
 
     static func makeForCurrentSetting() -> TransferEngine {
         let mock = UserDefaults.standard.bool(forKey: "useMockEngine")
-        FileHandle.standardError.write(Data("[diag] engine factory: \(mock ? "MOCK" : "PRODUCTION")\n".utf8))
         return mock ? MockEngineHolder.shared.engine : ProductionEngineFactory().makeEngine()
     }
 

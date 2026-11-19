@@ -344,7 +344,6 @@ final class QueueService {
             // 根列表读不到（新盘挂载怪癖/空目录 LIST 报错/偶发失败）→ 降级直传根目录。
             // 无目录列表 = 无重名判定（覆盖风险让位于可用性）；上传本身失败再如实报错
             let reason = (rootEntries.failureError as? LocalizedError)?.errorDescription ?? "未知"
-            FileHandle.standardError.write(Data("[queue] list / 失败（\(reason)）→ 降级直传根目录\n".utf8))
             startUploadWithFallback(id, dir: "/", handle: handle)
             return
         }
@@ -394,11 +393,9 @@ final class QueueService {
             let reason = (dirEntries.failureError as? LocalizedError)?.errorDescription ?? "未知"
             if dirExisted {
                 // 目录在第一跳确认存在，但列不出内容（空目录 LIST 报错的服务器怪癖）→ 降级直传该目录
-                FileHandle.standardError.write(Data("[queue] list \(dir) 失败（\(reason)）→ 降级直传该目录\n".utf8))
                 startUploadWithFallback(id, dir: dir, handle: handle)
             } else {
                 // 目录不存在且创建失败（MKD 550 等）→ 该目录传不进去，回根目录
-                FileHandle.standardError.write(Data("[queue] \(dir) 不存在且创建失败（\(reason)）→ 回退根目录\n".utf8))
                 startUploadWithFallback(id, dir: "/", handle: handle)
             }
             return
