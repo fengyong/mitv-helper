@@ -17,8 +17,7 @@ enum ServiceTests_B {
         testEmptyDiskFallback()
         testAutoMakeDir()
         testThumbCacheStore()
-        testTrashSafety()
-        testEmptyTrash()
+        testDirectDelete()
         testPauseAllCancelsHandles()
         testBatchNameCollisions()
         testThumbFetchSafety()
@@ -147,45 +146,23 @@ enum ServiceTests_B {
         assertEqual(SmartRouting.md5SuffixedName("无扩展名", digest8: "1b2c3d4e"), "无扩展名-1b2c3d4e", "无扩展名 md5 后缀")
     }
 
-    // MARK: - 软删除决策表（§7 三分支）
+    // MARK: - 删除决策表（直删，不再软删除）
 
     static func testSoftDeletePolicy() {
-        print("· 软删除决策表")
-        // 分支 1：rename=true → 软删除
-        var caps = Capabilities(deleteFile: false, rename: true)
-        assertEqual(SoftDeletePolicy.strategy(capabilities: caps, trashDirExists: false),
-                    .soft(.prefix), "rename 有、无 mkdir、回收站不存在 → 前缀兜底")
-        assertEqual(SoftDeletePolicy.strategy(capabilities: caps, trashDirExists: true),
-                    .soft(.directory), "rename 有、回收站已存在 → 目录形态")
-        caps.mkdir = true
-        assertEqual(SoftDeletePolicy.strategy(capabilities: caps, trashDirExists: false),
-                    .soft(.directory), "rename+mkdir 可用 → 目录形态（先建目录）")
-
-        // 分支 2：rename=false, deleteFile=true → 直删
-        caps = Capabilities(deleteFile: true, rename: false)
-        assertEqual(SoftDeletePolicy.strategy(capabilities: caps, trashDirExists: false),
-                    .hard, "仅 DELE 可用 → 直删")
-
-        // 分支 3：都不可用 → 禁用
+        print("· 删除决策表（直删）")
+        var caps = Capabilities(deleteFile: true, rename: false)
+        assertEqual(SoftDeletePolicy.strategy(capabilities: caps), .hard, "DELE 可用 → 直删")
+        caps = Capabilities(deleteFile: true, rename: true)
+        assertEqual(SoftDeletePolicy.strategy(capabilities: caps), .hard, "rename 可用也直删（不再进回收站）")
+        caps = Capabilities(deleteFile: false, rename: true)
+        assertEqual(SoftDeletePolicy.strategy(capabilities: caps), .disabled, "DELE 不可用 → 禁用")
         caps = Capabilities(deleteFile: false, rename: false)
-        assertEqual(SoftDeletePolicy.strategy(capabilities: caps, trashDirExists: false),
-                    .disabled, "都不支持 → 禁用")
+        assertEqual(SoftDeletePolicy.strategy(capabilities: caps), .disabled, "都不支持 → 禁用")
 
-        // 回收站路径构造
-        assertEqual(SoftDeletePolicy.directoryTrashPath(forRemotePath: "/Movies/a.mp4"),
-                    "/.MITV-Trash/Movies/a.mp4", "目录形态路径")
-        assertEqual(SoftDeletePolicy.directoryTrashPath(forRemotePath: "/a.mp4"),
-                    "/.MITV-Trash/a.mp4", "根文件目录形态路径")
-        assertEqual(SoftDeletePolicy.directoryTrashPath(forRemotePath: "/A/B/c.mp4"),
-                    "/.MITV-Trash/A--B/c.mp4", "多级父目录扁平化")
-        assertEqual(SoftDeletePolicy.prefixTrashName(forRemotePath: "/Movies/a.mp4"),
-                    ".MITV-Trash--Movies--a.mp4", "前缀兜底名（与契约示例一致）")
-        assertEqual(SoftDeletePolicy.prefixTrashName(forRemotePath: "/a.mp4"),
-                    ".MITV-Trash--a.mp4", "根文件前缀兜底名")
-        assertEqual(SoftDeletePolicy.flattenParent(ofPath: "/Movies/a.mp4"), "Movies", "flattenParent 单级")
-        assertEqual(SoftDeletePolicy.flattenParent(ofPath: "/a.mp4"), "", "flattenParent 根文件")
-        assertEqual(SoftDeletePolicy.parentFromPrefixTrashName(".MITV-Trash--Movies--a.mp4"), "Movies", "前缀名还原父目录")
+        // 历史回收站残留判定（旧版本软删除的文件仍可能留在电视上，浏览过滤要用）
         assertTrue(SoftDeletePolicy.isInTrashDir("/.MITV-Trash/Movies/a.mp4"), "回收站内判定")
+        assertTrue(SoftDeletePolicy.isInTrashDir("/.MITV-Trash"), "回收站根目录判定")
+        assertFalse(SoftDeletePolicy.isInTrashDir("/Movies/.MITV-Trash-x"), "相似路径不误判")
         assertTrue(SoftDeletePolicy.isPrefixTrashFile(name: ".MITV-Trash--Movies--a.mp4"), "前缀回收文件判定")
         assertFalse(SoftDeletePolicy.isPrefixTrashFile(name: "正常.mp4"), "普通文件不误判")
     }
@@ -556,7 +533,6 @@ extension ServiceTests_B {
         let files = TVFileService(engineProvider: { engine },
                                   endpointProvider: { FTPEndpoint(host: "mock") },
                                   capabilitiesProvider: { Capabilities() },
-                                  trashStore: TrashStore(directory: dir),
                                   thumbDirectory: dir.appendingPathComponent("thumbs"))
         func entry(_ name: String) -> FTPFileEntry {
             FTPFileEntry(path: "/Pictures/" + name, name: name, isDirectory: false, size: 100, modified: nil)
@@ -862,165 +838,114 @@ extension ServiceTests_B {
     }
 }
 
-// MARK: - 回收站数据安全（目标去重 / 还原占用守卫）
+// MARK: - 直删（DELE）批量行为
 
 extension ServiceTests_B {
 
-    /// 线程安全结果盒（restore 完成回调在后台队列）
-    final class RestoreBox {
+    /// 线程安全结果盒（引擎回调在后台队列，completion 在主队列）
+    final class DeleteBox {
         private let lock = NSLock()
-        private var _ok = -1
-        private var _bad = -1
-        var ok: Int { lock.lock(); defer { lock.unlock() }; return _ok }
-        var bad: Int { lock.lock(); defer { lock.unlock() }; return _bad }
-        func set(_ ok: Int, _ bad: Int) { lock.lock(); _ok = ok; _bad = bad; lock.unlock() }
+        private var _outcome: TVFileService.DeleteOutcome?
+        private var _error: Error?
+        private var _lastDone = -1
+        var outcome: TVFileService.DeleteOutcome? { lock.lock(); defer { lock.unlock() }; return _outcome }
+        var error: Error? { lock.lock(); defer { lock.unlock() }; return _error }
+        var lastDone: Int { lock.lock(); defer { lock.unlock() }; return _lastDone }
+        var done: Bool { lock.lock(); defer { lock.unlock() }; return _outcome != nil || _error != nil }
+        func set(_ result: Result<TVFileService.DeleteOutcome, Error>) {
+            lock.lock()
+            switch result {
+            case .success(let o): _outcome = o
+            case .failure(let e): _error = e
+            }
+            lock.unlock()
+        }
+        func progress(_ done: Int) { lock.lock(); _lastDone = done; lock.unlock() }
     }
 
-    static func testTrashSafety() {
-        print("· 回收站数据安全")
-        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-trash-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: baseDir) }
-        let softCaps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
-                                    mkdir: true, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
-        let trashDirEntry = FTPFileEntry(path: "/.MITV-Trash", name: ".MITV-Trash", isDirectory: true)
-        let moviesDir = FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true)
-        let victim = FTPFileEntry(path: "/Movies/a.mp4", name: "a.mp4", isDirectory: false, size: 5)
-
-        // 1) 目录形态：回收站已有同名旧文件 → 目标顺延，不覆盖先删的文件
-        do {
-            let engine = InlineEngine()
-            engine.allowMKD = true
-            engine.dirEntriesByPath["/"] = [moviesDir, trashDirEntry]
-            engine.dirEntriesByPath["/.MITV-Trash/Movies"] =
-                [FTPFileEntry(path: "/.MITV-Trash/Movies/a.mp4", name: "a.mp4", isDirectory: false, size: 5)]
-            let trash = TrashStore(directory: baseDir.appendingPathComponent("t1"))
-            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
-                                        capabilitiesProvider: { softCaps }, trashStore: trash)
-            service.deleteEntries([victim], progress: { _, _, _ in }) { _ in }
-            waitUntil("软删除完成记账") { trash.count == 1 }
-            assertEqual(engine.moveCalls.last?.to, "/.MITV-Trash/Movies/a (2).mp4", "回收站同名 → 顺延不覆盖")
-            assertEqual(trash.records.first?.trashPath, "/.MITV-Trash/Movies/a (2).mp4", "记账指向顺延后的真实路径")
-
-            // 2) 删→重传→再删：本地记账 + 远端列表合并去重 → 继续顺延
-            service.deleteEntries([victim], progress: { _, _, _ in }) { _ in }
-            waitUntil("第二次删除记账") { trash.count == 2 }
-            assertEqual(engine.moveCalls.last?.to, "/.MITV-Trash/Movies/a (3).mp4", "二次删除继续顺延（先删文件不被销毁）")
+    /// completion 派发在主队列：必须转主 RunLoop 才能收到（Thread.sleep 会饿死它）
+    static func waitMain(_ msg: String, timeout: TimeInterval = 5, _ cond: @escaping () -> Bool) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !cond() && Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
         }
-
-        // 3) 前缀形态：根目录已有同前缀名 → 同样顺延
-        do {
-            let engine = InlineEngine()
-            engine.dirEntriesByPath["/"] = [moviesDir,
-                FTPFileEntry(path: "/.MITV-Trash--Movies--a.mp4", name: ".MITV-Trash--Movies--a.mp4", isDirectory: false, size: 5)]
-            let prefixCaps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
-                                          mkdir: false, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
-            let trash = TrashStore(directory: baseDir.appendingPathComponent("t2"))
-            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
-                                        capabilitiesProvider: { prefixCaps }, trashStore: trash)
-            service.deleteEntries([victim], progress: { _, _, _ in }) { _ in }
-            waitUntil("前缀形态删除记账") { trash.count == 1 }
-            assertEqual(engine.moveCalls.last?.to, "/.MITV-Trash--Movies--a (2).mp4", "前缀形态同名也顺延")
-        }
-
-        // 4) 还原守卫：原路径已被重新上传的同名文件占用 → 跳过不覆盖，记录保留
-        do {
-            let engine = InlineEngine()
-            engine.dirEntriesByPath["/Movies"] = [victim]
-            let trash = TrashStore(directory: baseDir.appendingPathComponent("t3"))
-            trash.add(TrashStore.Record(id: "r1", trashPath: "/.MITV-Trash/Movies/a.mp4",
-                                        originalPath: "/Movies/a.mp4", name: "a.mp4", sizeBytes: 5, deletedAt: Date()))
-            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
-                                        capabilitiesProvider: { softCaps }, trashStore: trash)
-            let box = RestoreBox()
-            service.restore(trash.records, progress: { _, _, _ in }) { ok, bad in box.set(ok, bad) }
-            waitUntil("占用还原返回") { box.ok >= 0 }
-            assertEqual(box.ok, 0, "占用时不还原")
-            assertEqual(box.bad, 1, "占用计为失败")
-            assertEqual(engine.moveCalls.count, 0, "占用时不发起 move（不覆盖重传文件）")
-            assertEqual(trash.count, 1, "记录保留在回收站")
-
-            // 5) 原目录列不出 → 保守失败，不赌覆盖
-            engine.failListPath = "/Movies"
-            let box2 = RestoreBox()
-            service.restore(trash.records, progress: { _, _, _ in }) { ok, bad in box2.set(ok, bad) }
-            waitUntil("列不出返回") { box2.ok >= 0 }
-            assertEqual(box2.ok, 0, "原目录列不出 → 不还原")
-            assertEqual(engine.moveCalls.count, 0, "列不出也不发起 move")
-
-            // 6) 原路径空闲 → 正常还原，记录移除
-            engine.failListPath = nil
-            engine.dirEntriesByPath["/Movies"] = []
-            let box3 = RestoreBox()
-            service.restore(trash.records, progress: { _, _, _ in }) { ok, bad in box3.set(ok, bad) }
-            waitUntil("空闲还原返回") { box3.ok >= 0 }
-            assertEqual(box3.ok, 1, "空闲正常还原")
-            assertEqual(box3.bad, 0, "无失败")
-            assertEqual(engine.moveCalls.last?.from, "/.MITV-Trash/Movies/a.mp4", "从回收站移回")
-            assertEqual(engine.moveCalls.last?.to, "/Movies/a.mp4", "移回原路径")
-            assertEqual(trash.count, 0, "还原后记录移除")
-        }
+        assertTrue(cond(), msg)
     }
 
-    static func testEmptyTrash() {
-        print("· 清空回收站")
-        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-emptytrash-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: baseDir) }
+    static func testDirectDelete() {
+        print("· 直删批量行为")
         let caps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
                                 mkdir: true, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+        let a = FTPFileEntry(path: "/Movies/a.mp4", name: "a.mp4", isDirectory: false, size: 5)
+        let b = FTPFileEntry(path: "/Movies/b.mp4", name: "b.mp4", isDirectory: false, size: 7)
+        let dir = FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true)
 
-        // 1) 全部成功：逐条 DELE 记账路径，记录清空
+        // 1) 全部成功：按序逐条 DELE，目录不参与，进度到满
         do {
             let engine = InlineEngine()
-            let trash = TrashStore(directory: baseDir.appendingPathComponent("e1"))
-            trash.add(TrashStore.Record(id: "r1", trashPath: "/.MITV-Trash/Movies/a.mp4",
-                                        originalPath: "/Movies/a.mp4", name: "a.mp4", sizeBytes: 5, deletedAt: Date()))
-            trash.add(TrashStore.Record(id: "r2", trashPath: "/.MITV-Trash/Movies/b.mp4",
-                                        originalPath: "/Movies/b.mp4", name: "b.mp4", sizeBytes: 7, deletedAt: Date()))
             let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
-                                        capabilitiesProvider: { caps }, trashStore: trash)
-            let box = RestoreBox()
-            service.emptyTrash(progress: { _, _, _ in }) { ok, bad in box.set(ok, bad) }
-            waitUntil("清空完成") { box.ok >= 0 }
-            assertEqual(box.ok, 2, "两项全部删除")
-            assertEqual(box.bad, 0, "无失败")
-            assertEqual(engine.deleteCalls.count, 2, "逐条发起 DELE")
-            assertTrue(engine.deleteCalls.contains("/.MITV-Trash/Movies/a.mp4"), "删除记账路径 a")
-            assertTrue(engine.deleteCalls.contains("/.MITV-Trash/Movies/b.mp4"), "删除记账路径 b")
-            assertEqual(trash.count, 0, "成功后记录清空")
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([dir, a, b], progress: { done, total, _ in
+                box.progress(done)
+                if total != 2 { box.set(.failure(EngineError.unsupported("目录不应计入总数"))) }
+            }) { box.set($0) }
+            waitMain("直删完成") { box.done }
+            assertEqual(box.outcome?.deletedCount, 2, "两项全部删除")
+            assertEqual(box.outcome?.failedNames.count, 0, "无失败")
+            assertEqual(engine.deleteCalls, ["/Movies/a.mp4", "/Movies/b.mp4"], "按序 DELE，不删目录")
+            assertEqual(box.lastDone, 2, "进度到达满量")
         }
 
-        // 2) 部分失败：失败项记录保留（可重试），成功项移除
+        // 2) 部分失败：如实上报失败名单，失败后继续删剩余项
         do {
             let engine = InlineEngine()
-            engine.failDeletePaths = ["/.MITV-Trash/Movies/b.mp4"]
-            let trash = TrashStore(directory: baseDir.appendingPathComponent("e2"))
-            trash.add(TrashStore.Record(id: "r1", trashPath: "/.MITV-Trash/Movies/a.mp4",
-                                        originalPath: "/Movies/a.mp4", name: "a.mp4", sizeBytes: 5, deletedAt: Date()))
-            trash.add(TrashStore.Record(id: "r2", trashPath: "/.MITV-Trash/Movies/b.mp4",
-                                        originalPath: "/Movies/b.mp4", name: "b.mp4", sizeBytes: 7, deletedAt: Date()))
+            engine.failDeletePaths = ["/Movies/a.mp4"]
             let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
-                                        capabilitiesProvider: { caps }, trashStore: trash)
-            let box = RestoreBox()
-            service.emptyTrash(progress: { _, _, _ in }) { ok, bad in box.set(ok, bad) }
-            waitUntil("部分失败返回") { box.ok >= 0 }
-            assertEqual(box.ok, 1, "成功一项")
-            assertEqual(box.bad, 1, "失败一项")
-            assertEqual(trash.count, 1, "失败项记录保留")
-            assertEqual(trash.records.first?.id, "r2", "保留的是失败项")
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a, b], progress: { _, _, _ in }) { box.set($0) }
+            waitMain("部分失败返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 1, "成功一项")
+            assertEqual(box.outcome?.failedNames, ["a.mp4"], "失败名单如实上报")
+            assertEqual(engine.deleteCalls.count, 2, "失败不中断，继续删剩余项")
         }
 
-        // 3) 空回收站：不发起任何引擎调用
+        // 3) 能力不支持：报 unsupported，不发起任何 DELE
         do {
             let engine = InlineEngine()
-            let trash = TrashStore(directory: baseDir.appendingPathComponent("e3"))
+            let noDelete = Capabilities(deleteFile: false, rename: true)
             let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
-                                        capabilitiesProvider: { caps }, trashStore: trash)
-            let box = RestoreBox()
-            service.emptyTrash(progress: { _, _, _ in }) { ok, bad in box.set(ok, bad) }
-            waitUntil("空回收站返回") { box.ok >= 0 }
-            assertEqual(box.ok, 0, "空回收站 0 删除")
-            assertEqual(box.bad, 0, "空回收站 0 失败")
-            assertEqual(engine.deleteCalls.count, 0, "空回收站不发起 DELE")
+                                        capabilitiesProvider: { noDelete })
+            let box = DeleteBox()
+            service.deleteEntries([a], progress: { _, _, _ in }) { box.set($0) }
+            waitMain("不支持返回") { box.done }
+            if case .unsupported = box.error {} else { assertTrue(false, "不支持删除 → unsupported 错误") }
+            assertEqual(engine.deleteCalls.count, 0, "不支持时不发起 DELE")
+        }
+
+        // 4) 空选择 / 只有目录：0 删除，不发起引擎调用
+        do {
+            let engine = InlineEngine()
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([dir], progress: { _, _, _ in }) { box.set($0) }
+            waitMain("空选择返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 0, "只有目录 → 0 删除")
+            assertEqual(engine.deleteCalls.count, 0, "空选择不发起 DELE")
+        }
+
+        // 5) 未连接：报 notConnected
+        do {
+            let engine = InlineEngine()
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { nil },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a], progress: { _, _, _ in }) { box.set($0) }
+            waitMain("未连接返回") { box.done }
+            if case .notConnected = box.error {} else { assertTrue(false, "未连接 → notConnected 错误") }
+            assertEqual(engine.deleteCalls.count, 0, "未连接不发起 DELE")
         }
     }
 }

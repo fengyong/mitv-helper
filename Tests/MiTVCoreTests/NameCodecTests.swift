@@ -46,10 +46,5 @@ enum NameCodecTests {
         let nearLimit = String(repeating: "b", count: 250) + ".mp4"
         let deduped = NameCodec.uniqued(nearLimit, existing: [nearLimit])
         assertTrue(gbkBytes(NameCodec.capped(deduped).name) <= NameCodec.maxNameBytes, "重名顺延后再截断仍 ≤255")
-        let longTrash = SoftDeletePolicy.prefixTrashName(forRemotePath: "/" + String(repeating: "目录", count: 100) + "/" + longCN)
-        assertTrue(gbkBytes(longTrash) <= NameCodec.maxNameBytes, "回收站前缀名截断到 255 字节内")
-        assertTrue(longTrash.hasPrefix(SoftDeletePolicy.prefixTag), "截断保留回收站前缀")
-        let longFlat = SoftDeletePolicy.flattenParent(ofPath: "/" + String(repeating: "目录", count: 100) + "/f.mp4")
-        assertTrue(gbkBytes(longFlat) <= NameCodec.maxNameBytes, "扁平化父目录截断到 255 字节内")
     }
 }

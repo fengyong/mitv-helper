@@ -2,68 +2,7 @@ import AVFoundation
 import AppKit
 import Foundation
 
-/// 电视端删除记账（软删除的「原路径在哪」）：JSON 原子写。
-final class TrashStore {
-
-    struct Record: Codable, Equatable {
-        let id: String
-        /// 移动后的路径（目录形态 /.MITV-Trash/... 或前缀形态 /.MITV-Trash--...）
-        var trashPath: String
-        /// 原始完整路径（撤销时 rename 回去）
-        var originalPath: String
-        var name: String
-        var sizeBytes: Int64
-        var deletedAt: Date
-    }
-
-    private let fileURL: URL
-    private let lock = NSLock()
-    private(set) var records: [Record] = []
-
-    init(directory: URL = TVStore.defaultDirectory()) {
-        fileURL = directory.appendingPathComponent("trash.json")
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
-        reload()
-    }
-
-    func reload() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let data = try? Data(contentsOf: fileURL) else { return }
-        let dec = JSONDecoder()
-        dec.dateDecodingStrategy = .iso8601
-        records = (try? dec.decode([Record].self, from: data)) ?? []
-    }
-
-    private func persist() {
-        let enc = JSONEncoder()
-        enc.dateEncodingStrategy = .iso8601
-        enc.outputFormatting = [.sortedKeys]
-        if let data = try? enc.encode(records) {
-            try? data.write(to: fileURL, options: .atomic)
-        }
-    }
-
-    func add(_ record: Record) {
-        lock.lock()
-        records.append(record)
-        persist()
-        lock.unlock()
-    }
-
-    func remove(ids: [String]) {
-        lock.lock()
-        let set = Set(ids)
-        records.removeAll { set.contains($0.id) }
-        persist()
-        lock.unlock()
-    }
-
-    var totalBytes: Int64 { lock.lock(); defer { lock.unlock() }; return records.reduce(0) { $0 + $1.sizeBytes } }
-    var count: Int { lock.lock(); defer { lock.unlock() }; return records.count }
-}
-
-/// 电视文件服务：浏览 / 取回下载编排 / 软删除（按 §7 决策表）/ 缩略图。
+/// 电视文件服务：浏览 / 取回下载编排 / 直删（DELE）/ 缩略图。
 final class TVFileService {
 
     // MARK: 注入
@@ -71,18 +10,15 @@ final class TVFileService {
     private let engineProvider: () -> TransferEngine
     private let endpointProvider: () -> FTPEndpoint?
     private let capabilitiesProvider: () -> Capabilities?
-    let trashStore: TrashStore
     private let thumbDirectoryOverride: URL?
 
     init(engineProvider: @escaping () -> TransferEngine,
          endpointProvider: @escaping () -> FTPEndpoint?,
          capabilitiesProvider: @escaping () -> Capabilities?,
-         trashStore: TrashStore,
          thumbDirectory: URL? = nil) {
         self.engineProvider = engineProvider
         self.endpointProvider = endpointProvider
         self.capabilitiesProvider = capabilitiesProvider
-        self.trashStore = trashStore
         self.thumbDirectoryOverride = thumbDirectory
     }
 
@@ -112,271 +48,48 @@ final class TVFileService {
         }
     }
 
-    // MARK: 删除（§7 决策表）
+    // MARK: 删除（直删 DELE，永久不可撤销）
 
     /// 当前能力下的删除策略（UI 用它决定按钮与文案）
-    func currentStrategy(trashDirExists: Bool = false) -> DeleteStrategy {
-        SoftDeletePolicy.strategy(capabilities: capabilitiesProvider() ?? Capabilities(),
-                                  trashDirExists: trashDirExists)
+    func currentStrategy() -> DeleteStrategy {
+        SoftDeletePolicy.strategy(capabilities: capabilitiesProvider() ?? Capabilities())
     }
 
-    /// 批量删除结果：成功记账（撤销用）+ 失败名单（部分失败如实上报，不再被吞掉）
+    /// 批量删除结果：成功数 + 失败名单（部分失败如实上报，不再被吞掉）
     struct DeleteOutcome {
-        let records: [TrashStore.Record]
+        let deletedCount: Int
         let failedNames: [String]
     }
 
-    /// 批量删除。progress(done, total, name) 主队列；completion 返回成功记账与失败名单。
+    /// 批量直删。progress(done, total, name) 主队列；completion 返回成功数与失败名单。
     func deleteEntries(_ entries: [FTPFileEntry],
                        progress: @escaping (_ done: Int, _ total: Int, _ name: String) -> Void,
                        completion: @escaping (Result<DeleteOutcome, Error>) -> Void) {
         let files = entries.filter { !$0.isDirectory }
-        guard !files.isEmpty else { completion(.success(DeleteOutcome(records: [], failedNames: []))); return }
+        guard !files.isEmpty else { completion(.success(DeleteOutcome(deletedCount: 0, failedNames: []))); return }
         guard let endpoint = endpointProvider() else {
             completion(.failure(EngineError.notConnected))
             return
         }
-        let engine = engineProvider()
         let caps = capabilitiesProvider() ?? Capabilities()
-
-        // 软删除：先确保回收站目录存在（mkdir 可用则尝试建；不行则前缀形态兜底）
-        func beginSoftDelete() {
-            let doPrefix: () -> Void = { self.softDelete(files, form: .prefix, endpoint: endpoint, engine: engine, progress: progress, completion: completion) }
-            // 目录形态需要 /.MITV-Trash/<扁平化父目录> 存在（review B2）：逐个尽力 MKD（失败继续——可能已存在，真失败由 move 上报）
-            let parentNames = Set(files.map { SoftDeletePolicy.flattenParent(ofPath: $0.path) }.filter { !$0.isEmpty })
-            let doDirectory: () -> Void = {
-                guard !parentNames.isEmpty else { self.softDelete(files, form: .directory, endpoint: endpoint, engine: engine, progress: progress, completion: completion); return }
-                var remaining = parentNames
-                func mkNext() {
-                    if let name = remaining.popFirst() {
-                        engine.makeDirectory(endpoint, path: SoftDeletePolicy.trashRoot + "/" + name) { _ in mkNext() }
-                    } else {
-                        self.softDelete(files, form: .directory, endpoint: endpoint, engine: engine, progress: progress, completion: completion)
-                    }
-                }
-                mkNext()
-            }
-            if caps.mkdir {
-                engine.makeDirectory(endpoint, path: SoftDeletePolicy.trashRoot) { _ in
-                    // 无论 mkdir 成败，都用 list 验证目录是否存在（可能早已存在）
-                    self.checkTrashDir(endpoint, exists: { exists in
-                        exists ? doDirectory() : doPrefix()
-                    })
-                }
-            } else {
-                self.checkTrashDir(endpoint, exists: { exists in
-                    exists ? doDirectory() : doPrefix()
-                })
-            }
-        }
-
-        switch SoftDeletePolicy.strategy(capabilities: caps, trashDirExists: false) {
-        case .soft:
-            beginSoftDelete()
-        case .hard:
-            hardDelete(files, endpoint: endpoint, engine: engine, progress: progress, completion: completion)
-        case .disabled:
+        guard caps.deleteFile else {
             completion(.failure(EngineError.unsupported("删除")))
+            return
         }
-    }
-
-    private func checkTrashDir(_ endpoint: FTPEndpoint, exists: @escaping (Bool) -> Void) {
-        engineProvider().list(endpoint, path: "/") { result in
-            guard case .success(let entries) = result else { exists(false); return }
-            exists(entries.contains { $0.isDirectory && $0.name == SoftDeletePolicy.trashRoot.replacingOccurrences(of: "/", with: "") })
-        }
-    }
-
-    private func softDelete(_ files: [FTPFileEntry], form: DeleteStrategy.TrashForm,
-                            endpoint: FTPEndpoint, engine: TransferEngine,
-                            progress: @escaping (Int, Int, String) -> Void,
-                            completion: @escaping (Result<DeleteOutcome, Error>) -> Void) {
-        // 目标名去重：回收站里可能已有同名旧文件（删→重传→再删）。RNTO 覆盖语义不明，
-        // 直接撞名会静默销毁先删的文件、撤销还原出错误内容 → 先列出回收站目录占用名，撞名顺延。
-        func trashDir(of entry: FTPFileEntry) -> String {
-            switch form {
-            case .directory:
-                let parent = SoftDeletePolicy.flattenParent(ofPath: entry.path)
-                return parent.isEmpty ? SoftDeletePolicy.trashRoot : SoftDeletePolicy.trashRoot + "/" + parent
-            case .prefix:
-                return "/"
-            }
-        }
-        var occupied: [String: Set<String>] = [:]
-        for dir in Set(files.map { trashDir(of: $0) }) {
-            // 本地记账先兜底；远端列表补充孤儿文件（应用数据丢失后残留）
-            occupied[dir] = Set(trashStore.records.filter { ($0.trashPath as NSString).deletingLastPathComponent == dir }
-                .map { ($0.trashPath as NSString).lastPathComponent })
-        }
-        let dirs = Array(occupied.keys)
-        var records: [TrashStore.Record] = []
+        let engine = engineProvider()
+        var deleted = 0
         var failedNames: [String] = []
         let total = files.count
         func step(_ i: Int) {
             guard i < total else {
-                DispatchQueue.main.async { completion(.success(DeleteOutcome(records: records, failedNames: failedNames))) }
-                return
-            }
-            let entry = files[i]
-            progress(i, total, entry.name)
-            let dir = trashDir(of: entry)
-            let base: String
-            switch form {
-            case .directory:
-                base = (SoftDeletePolicy.directoryTrashPath(forRemotePath: entry.path) as NSString).lastPathComponent
-            case .prefix:
-                base = SoftDeletePolicy.prefixTrashName(forRemotePath: entry.path)
-            }
-            let unique = NameCodec.uniqued(base, existing: occupied[dir] ?? [], caseInsensitive: true)
-            let target = dir == "/" ? "/" + unique : dir + "/" + unique
-            engine.move(endpoint, from: entry.path, to: target) { error in
-                if error == nil {
-                    occupied[dir, default: []].insert(unique)
-                    let record = TrashStore.Record(id: UUID().uuidString,
-                                                   trashPath: target,
-                                                   originalPath: entry.path,
-                                                   name: entry.name,
-                                                   sizeBytes: entry.size ?? 0,
-                                                   deletedAt: Date())
-                    self.trashStore.add(record)
-                    records.append(record)
-                } else {
-                    failedNames.append(entry.name)
-                }
-                progress(i + 1, total, entry.name)
-                step(i + 1)
-            }
-        }
-        func listNext(_ i: Int) {
-            guard i < dirs.count else { step(0); return }
-            let dir = dirs[i]
-            engine.list(endpoint, path: dir) { result in
-                if case .success(let entries) = result {
-                    let names = entries.filter { !$0.isDirectory }.map { $0.name }
-                    occupied[dir] = (occupied[dir] ?? []).union(names)
-                }
-                // 列表失败不阻断删除：本地记账仍提供去重兜底
-                listNext(i + 1)
-            }
-        }
-        listNext(0)
-    }
-
-    private func hardDelete(_ files: [FTPFileEntry], endpoint: FTPEndpoint, engine: TransferEngine,
-                            progress: @escaping (Int, Int, String) -> Void,
-                            completion: @escaping (Result<DeleteOutcome, Error>) -> Void) {
-        var failedNames: [String] = []
-        let total = files.count
-        func step(_ i: Int) {
-            guard i < total else {
-                DispatchQueue.main.async { completion(.success(DeleteOutcome(records: [], failedNames: failedNames))) }
+                DispatchQueue.main.async { completion(.success(DeleteOutcome(deletedCount: deleted, failedNames: failedNames))) }
                 return
             }
             let entry = files[i]
             progress(i, total, entry.name)
             engine.delete(endpoint, remotePath: entry.path) { error in
-                if error != nil { failedNames.append(entry.name) }
+                if error == nil { deleted += 1 } else { failedNames.append(entry.name) }
                 progress(i + 1, total, entry.name)
-                step(i + 1)
-            }
-        }
-        step(0)
-    }
-
-    /// 撤销：把记录的文件移回原位。原路径已被占用（删除后重新上传了同名文件）时跳过该项，
-    /// 绝不覆盖——记录保留在回收站，用户可稍后处理。
-    func restore(_ records: [TrashStore.Record],
-                 progress: @escaping (_ done: Int, _ total: Int, _ name: String) -> Void,
-                 completion: @escaping (_ restoredCount: Int, _ failedCount: Int) -> Void) {
-        guard let endpoint = endpointProvider() else {
-            completion(0, records.count)
-            return
-        }
-        let engine = engineProvider()
-        let total = records.count
-        var ok = 0
-        var bad = 0
-        var restoredIds: [String] = []
-        // 预列原目录占用名（每个父目录一次）；列不出的目录保守判失败，不赌覆盖
-        var occupied: [String: Set<String>] = [:]
-        var unlistable = Set<String>()
-        let parents = Set(records.map { ($0.originalPath as NSString).deletingLastPathComponent })
-        let parentList = Array(parents)
-        func step(_ i: Int) {
-            guard i < total else {
-                trashStore.remove(ids: restoredIds)
-                completion(ok, bad)
-                return
-            }
-            let record = records[i]
-            progress(i, total, record.name)
-            let dir = (record.originalPath as NSString).deletingLastPathComponent
-            let nameKey = ((record.originalPath as NSString).lastPathComponent).lowercased()
-            if unlistable.contains(dir) || (occupied[dir]?.contains(nameKey) == true) {
-                bad += 1
-                progress(i + 1, total, record.name)
-                step(i + 1)
-                return
-            }
-            engine.move(endpoint, from: record.trashPath, to: record.originalPath) { error in
-                if error == nil {
-                    ok += 1
-                    restoredIds.append(record.id)
-                    occupied[dir, default: []].insert(nameKey)
-                } else {
-                    bad += 1
-                }
-                progress(i + 1, total, record.name)
-                step(i + 1)
-            }
-        }
-        func listNext(_ i: Int) {
-            guard i < parentList.count else { step(0); return }
-            let dir = parentList[i]
-            engine.list(endpoint, path: dir) { result in
-                switch result {
-                case .success(let entries):
-                    occupied[dir] = Set(entries.filter { !$0.isDirectory }.map { $0.name.lowercased() })
-                case .failure:
-                    unlistable.insert(dir)
-                }
-                listNext(i + 1)
-            }
-        }
-        listNext(0)
-    }
-
-    /// 清空回收站：永久删除本地记账里的全部文件（不可撤销，UI 必须先确认）。
-    /// 只删有记账的路径——回收站目录里的无主孤儿文件不动，避免误删应用之外的数据。
-    func emptyTrash(progress: @escaping (_ done: Int, _ total: Int, _ name: String) -> Void,
-                    completion: @escaping (_ deletedCount: Int, _ failedCount: Int) -> Void) {
-        let records = trashStore.records
-        guard !records.isEmpty else { completion(0, 0); return }
-        guard let endpoint = endpointProvider() else {
-            completion(0, records.count)
-            return
-        }
-        let engine = engineProvider()
-        let total = records.count
-        var ok = 0
-        var bad = 0
-        var removedIds: [String] = []
-        func step(_ i: Int) {
-            guard i < total else {
-                trashStore.remove(ids: removedIds)
-                completion(ok, bad)
-                return
-            }
-            let record = records[i]
-            progress(i, total, record.name)
-            engine.delete(endpoint, remotePath: record.trashPath) { error in
-                if error == nil {
-                    ok += 1
-                    removedIds.append(record.id)
-                } else {
-                    bad += 1
-                }
-                progress(i + 1, total, record.name)
                 step(i + 1)
             }
         }

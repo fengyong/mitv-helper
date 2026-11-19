@@ -232,17 +232,10 @@ final class ConfirmOverlay: NSView {
         }
 
         switch strategy {
-        case .soft:
-            isHard = false
-            titleLabel.stringValue = "移到电视回收站？"
-            subLabel.stringValue = "已选 \(files.count) 项 · 共 \(Fmt.bytes(total))\n随时可以撤销"
-            confirmButton.title = "移到回收站"
-            confirmButton.style = .primary
-            downloadCheck.isHidden = true
         case .hard:
             isHard = true
             titleLabel.stringValue = "永久删除？"
-            subLabel.stringValue = "已选 \(files.count) 项 · 共 \(Fmt.bytes(total))\n这台电视不支持回收站，删除后无法撤销"
+            subLabel.stringValue = "已选 \(files.count) 项 · 共 \(Fmt.bytes(total))\n删除后无法撤销"
             confirmButton.title = "永久删除，无法撤销"
             confirmButton.style = .danger
             downloadCheck.isHidden = false

@@ -8,7 +8,6 @@ final class AppCoordinator: NSObject {
     // MARK: - 服务
 
     let store = TVStore()
-    let trashStore = TrashStore()
     let staging = StagingStore()
     let picks = PickService()
 
@@ -27,8 +26,7 @@ final class AppCoordinator: NSObject {
     lazy var files = TVFileService(
         engineProvider: { EngineHolder.shared.engine() },
         endpointProvider: { [weak self] in self?.store.endpoint },
-        capabilitiesProvider: { [weak self] in self?.store.capabilities },
-        trashStore: trashStore)
+        capabilitiesProvider: { [weak self] in self?.store.capabilities })
 
     // MARK: - 视图
 
@@ -251,9 +249,6 @@ final class AppCoordinator: NSObject {
         if auto == "browser" {
             if env["MITV_AUTO_DELETE"] == "1" {
                 self.browserView.smokeDeleteFirstFile()
-            }
-            if env["MITV_AUTO_UNDO"] == "1" {
-                self.browserView.smokeUndoAll()
             }
         }
         if auto == "queue" {
@@ -523,7 +518,8 @@ final class AppCoordinator: NSObject {
         }
         let isDownload = queue.snapshot().first { $0.batchId == batchId }?.direction == .download
         if ok > 0 {
-            showToast(isDownload ? "已把 \(ok) 个文件取回到本地" : "已把 \(ok) 个文件送到电视")
+            // 电视写 U 盘是异步刷写：传完立刻播放/拔盘可能读到未落盘的空文件（实测 0 字节）
+            showToast(isDownload ? "已把 \(ok) 个文件取回到本地" : "已把 \(ok) 个文件送到电视 · 稍等片刻再播放或拔盘")
             if UserDefaults.standard.bool(forKey: "soundOnComplete") {
                 NSSound(named: NSSound.Name("Glass"))?.play()
             }
@@ -614,7 +610,7 @@ final class AppCoordinator: NSObject {
         }
     }
 
-    /// 删除确认浮层（软删除/直删/不支持 三种文案，见 §7）
+    /// 删除确认浮层（直删/不支持 两种文案）
     func confirmDelete(_ entries: [FTPFileEntry], completion: @escaping () -> Void) {
         let strategy = files.currentStrategy()
         let overlay = ConfirmOverlay.show(entries: entries, strategy: strategy, in: rootDrop) { [weak self] downloadFirst in
@@ -652,28 +648,10 @@ final class AppCoordinator: NSObject {
             guard let self = self else { return }
             switch result {
             case .success(let outcome):
-                if !outcome.records.isEmpty {
-                    // 软删除：可撤销（部分失败也如实说明）
-                    var text = "已删除 \(outcome.records.count) 项 · 随时可撤销"
-                    if !outcome.failedNames.isEmpty {
-                        text = "已删除 \(outcome.records.count) 项 · \(outcome.failedNames.count) 项没有成功 · 可撤销"
-                    }
-                    self.showToast(text, undo: { [weak self] in
-                        self?.files.restore(outcome.records,
-                                            progress: { _, _, _ in }) { restored, failed in
-                            guard let self = self else { return }
-                            if restored > 0 { self.showToast("已还原 \(restored) 项") }
-                            if failed > 0 { self.showToast("有 \(failed) 项未还原（原位置已有同名文件或连接失败）· 仍在回收站") }
-                            // 撤销后刷新界面（review D2）：不刷的话文件已回来但列表缺失，用户会以为撤销失败
-                            if self.mode == .browser {
-                                self.browserView.reloadAfterRestore()
-                            }
-                        }
-                    })
-                } else if outcome.failedNames.isEmpty {
-                    self.showToast("已永久删除 \(total) 项")
-                } else if outcome.failedNames.count < total {
-                    self.showToast("已永久删除 \(total - outcome.failedNames.count) 项 · \(outcome.failedNames.count) 项没有成功")
+                if outcome.failedNames.isEmpty {
+                    self.showToast("已永久删除 \(outcome.deletedCount) 项")
+                } else if outcome.deletedCount > 0 {
+                    self.showToast("已永久删除 \(outcome.deletedCount) 项 · \(outcome.failedNames.count) 项没有成功")
                 } else {
                     self.showToast("删除没有完成：\(outcome.failedNames.joined(separator: "、"))")
                 }
