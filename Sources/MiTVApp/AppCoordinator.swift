@@ -149,6 +149,7 @@ final class AppCoordinator: NSObject {
         showState(emptyView)
         showWindow()
         refreshHeader()
+        updateStatusBar() // 启动即渲染状态栏（构建号从首帧可见，不等连接完成）
 
         if let endpoint = store.endpoint, store.state.onboardingDone {
             connect(endpoint: endpoint, silent: true)
@@ -343,17 +344,20 @@ final class AppCoordinator: NSObject {
         let busy = items.filter { $0.phase == .connecting || $0.phase == .running }
         let queued = items.filter { $0.phase == .queued }
         let speed = busy.reduce(0.0) { $0 + $1.bytesPerSecond }
+        // 状态栏右侧常显构建号，一眼确认当前运行的是哪次 build
+        let buildTag = "build \(appBuildNumber)"
+        let right = queued.isEmpty ? buildTag : "\(buildTag) · 排队 \(queued.count) 项"
         if !busy.isEmpty {
             let totalLeft = busy.reduce(Int64(0)) { $0 + max(0, ($1.sizeBytes - $1.bytes)) }
             var text = "正在发送 \(busy.count) 项"
             if let eta = Fmt.eta(totalLeft, bps: speed) { text += " · \(eta)" }
-            statusBar.set(left: text, right: queued.isEmpty ? nil : "排队 \(queued.count) 项")
+            statusBar.set(left: text, right: right)
         } else if heartbeatStatus == .connected {
-            statusBar.set(left: "就绪 · 电视已连接", right: nil)
+            statusBar.set(left: "就绪 · 电视已连接", right: right)
         } else if case .lost = heartbeatStatus {
-            statusBar.set(left: "电视连接不上 · 正在等待重连", right: nil)
+            statusBar.set(left: "电视连接不上 · 正在等待重连", right: right)
         } else {
-            statusBar.set(left: "就绪", right: nil)
+            statusBar.set(left: "就绪", right: right)
         }
     }
 
