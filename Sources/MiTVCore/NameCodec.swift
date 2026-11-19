@@ -46,15 +46,19 @@ public enum NameCodec {
         return isGBKRepresentable(String(ch))
     }
 
-    /// 重名冲突：a.mp4 → a (2).mp4 → a (3).mp4
-    public static func uniqued(_ proposed: String, existing: Set<String>) -> String {
-        guard existing.contains(proposed) else { return proposed }
+    /// 重名冲突：a.mp4 → a (2).mp4 → a (3).mp4；未被占用 → 原样返回
+    /// caseInsensitive=true 按大小写不敏感判定（电视 U 盘几乎都是 FAT/exFAT，大小写不敏感文件系统）
+    public static func uniqued(_ proposed: String, existing: Set<String>, caseInsensitive: Bool = false) -> String {
+        let keys = caseInsensitive ? Set(existing.map { $0.lowercased() }) : existing
+        let proposedKey = caseInsensitive ? proposed.lowercased() : proposed
+        guard keys.contains(proposedKey) else { return proposed } // 未被占用 → 原样
         let stem = (proposed as NSString).deletingPathExtension
         let ext = (proposed as NSString).pathExtension
         var i = 2
         while true {
             let candidate = ext.isEmpty ? "\(stem) (\(i))" : "\(stem) (\(i)).\(ext)"
-            if !existing.contains(candidate) { return candidate }
+            let candidateKey = caseInsensitive ? candidate.lowercased() : candidate
+            if !keys.contains(candidateKey) { return candidate }
             i += 1
         }
     }

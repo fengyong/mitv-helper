@@ -489,5 +489,22 @@ extension ServiceTests_B {
             assertTrue(it.skippedReason != nil, "收敛为跳过")
             assertEqual(it.remotePath, "/Movies/" + candName, "跳过指向已有指纹文件")
         }
+
+        // 6) 同名仅大小写不同（FAT U 盘）→ 仍按同名判定，相同内容跳过
+        do {
+            let engine = InlineEngine()
+            let upper = fname.uppercased()
+            engine.dirEntries = [moviesDir,
+                                 FTPFileEntry(path: "/Movies/" + upper, name: upper, isDirectory: false,
+                                              size: Int64(content.count))]
+            engine.remotePrefix = content
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("casefold"),
+                                     concurrency: 1, resumeOnStart: true)
+            queue.addUploads([f1])
+            waitUntil("仅大小写不同的同名 → 跳过") { queue.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.count, 0, "大小写不同也不覆盖（FAT 语义）")
+            assertTrue(queue.snapshot().first?.skippedReason != nil, "按相同文件跳过")
+        }
     }
 }

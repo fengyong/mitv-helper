@@ -431,9 +431,19 @@ final class AppCoordinator: NSObject {
 
     func enqueueFileURLs(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
-        let result = PickService.filterMedia(urls)
+        // 与文件面板同路径：文件夹递归展开成媒体文件（否则整夹拖入会被当 .other 全部忽略）
+        var expanded: [URL] = []
+        for url in urls {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                expanded.append(contentsOf: PickService.expandFolder(url))
+            } else {
+                expanded.append(url)
+            }
+        }
+        let result = PickService.filterMedia(expanded)
         guard !result.media.isEmpty else {
-            showToast("这些文件不是照片或视频")
+            showToast(expanded.count != urls.count ? "文件夹里没有可发送的照片或视频" : "这些文件不是照片或视频")
             return
         }
         guard store.endpoint != nil, store.state.onboardingDone else {

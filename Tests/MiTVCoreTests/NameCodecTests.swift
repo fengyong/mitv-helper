@@ -28,5 +28,7 @@ enum NameCodecTests {
         assertEqual(NameCodec.remoteName(for: "...").remote, "file", "整名特殊字符兜底")
         assertEqual(NameCodec.remoteName(for: "a\tb.mp4").remote, "a-b.mp4", "控制字符替换")
         assertFalse(NameCodec.remoteName(for: "正常名字 [高清].mp4").needsMapping, "GBK 可表示且安全 → 不改写")
+        assertEqual(NameCodec.uniqued("a.mp4", existing: ["A.mp4"], caseInsensitive: true), "a (2).mp4", "大小写不敏感重名顺延")
+        assertEqual(NameCodec.uniqued("a.mp4", existing: ["A.mp4"]), "a.mp4", "默认大小写敏感（契约不变）")
     }
 }

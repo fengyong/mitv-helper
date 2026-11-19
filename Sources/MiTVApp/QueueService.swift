@@ -347,7 +347,7 @@ final class QueueService {
         })
         let mapped = NameCodec.remoteName(for: items[idx].displayName)
         // 磁盘上已有同名文件 → 「相同文件」判定（尺寸 → 前 10MB 指纹）
-        if let clash = dirList.first(where: { !$0.isDirectory && $0.name == mapped.remote }) {
+        if let clash = dirList.first(where: { !$0.isDirectory && $0.name.caseInsensitiveCompare(mapped.remote) == .orderedSame }) { // FAT 大小写不敏感
             decideSameFileOrSuffix(id, dir: dir, proposedName: mapped.remote, needsMapping: mapped.needsMapping,
                                    clash: clash, dirList: dirList, inflight: inflight, handle: handle)
             return
@@ -383,7 +383,7 @@ final class QueueService {
 
                 // 第二层：指纹名已存在 → 对其判定（相同 → 跳过；不同/判不了 → 顺延）
                 func uploadOrConverge() {
-                    if let second = dirList.first(where: { !$0.isDirectory && $0.name == candidate }) {
+                    if let second = dirList.first(where: { !$0.isDirectory && $0.name.caseInsensitiveCompare(candidate) == .orderedSame }) {
                         self.verifyRemoteSameFile(id: id, clash: second, localSize: localSize,
                                                   localHex: localHex, prefixLen: prefixLen) { same2 in
                             self.stateQ.async {
@@ -458,7 +458,7 @@ final class QueueService {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
         guard items[idx].phase == .connecting else { return } // 可能已被暂停/取消
         let allNames = SmartRouting.existingNames(entries: dirList).union(inflight)
-        let unique = NameCodec.uniqued(remoteName, existing: allNames)
+        let unique = NameCodec.uniqued(remoteName, existing: allNames, caseInsensitive: true)
         items[idx].remoteDir = dir
         items[idx].remotePath = dir == "/" ? "/" + unique : dir + "/" + unique
         items[idx].needsNameMapping = needsMapping
