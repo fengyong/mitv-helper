@@ -342,7 +342,7 @@ enum ServiceTests_B {
         assertEqual(snap[0].remoteDir, "/Movies", "智能分流命中 Movies")
         assertTrue(snap[0].remotePath?.hasPrefix("/Movies/") == true, "远端路径落在 Movies/")
         assertEqual(engine.uploadCalls.count, 1, "引擎被调用一次")
-        assertTrue(engine.uploadCalls[0].resume, "能力矩阵 appeResume=true → resume 标志开启（引擎 SIZE 校验决定是否续传）")
+        assertFalse(engine.uploadCalls[0].resume, "首传强制整传（resume=false）：防同名旧文件被 APPE 拼接出坏文件")
         assertTrue((try? Data(contentsOf: dir.appendingPathComponent("queue.json"))) != nil, "queue.json 已写")
 
         // 2. 悬挂上传 → 暂停 → resume（APPE 续传标志）→ 完成
@@ -355,8 +355,9 @@ enum ServiceTests_B {
         queue.pause(id: runningID)
         waitUntil("暂停生效") { queue.snapshot().first { $0.id == runningID }?.phase == .paused }
         queue.resume(id: runningID)
-        waitUntil("恢复后再次调用引擎") { engine.uploadCalls.count == 2 }
-        assertTrue(engine.uploadCalls[1].resume, "resume 上传带 APPE 续传标志")
+        // 恢复 = 续传：beginTransfer 走 remotePath != nil 分支，再次调用引擎且开 APPE
+        waitUntil("恢复后再次调用引擎（续传第二次 upload）") { engine.uploadCalls.count == 3 }
+        assertTrue(engine.uploadCalls[2].resume, "暂停恢复=同任务续传 → APPE 标志")
         engine.releaseAllUploads(.success(1))
         waitUntil("悬挂恢复后完成") { queue.snapshot().filter { $0.phase == .completed }.count == 2 }
 
@@ -370,8 +371,11 @@ enum ServiceTests_B {
         }
         assertTrue(queue.snapshot().first(where: { $0.id == failedID })?.failureReason != nil, "失败原因已记录")
         engine.failUploads = false
+        let callsBeforeRetry = engine.uploadCalls.count
         queue.retry(id: failedID)
         waitUntil("重试后完成") { queue.snapshot().first { $0.id == failedID }?.phase == .completed }
+        assertEqual(engine.uploadCalls.count, callsBeforeRetry + 1, "重试再次调用引擎")
+        assertTrue(engine.uploadCalls[callsBeforeRetry].resume, "重试=同任务续传 → APPE（远端半截确为本任务文件前缀）")
 
         // 4. 清空已完成
         queue.clearFinished()

@@ -166,16 +166,25 @@ public final class SwiftFTPEngine: TransferEngine {
                     }
                 }
 
+                let sentBytes: Int64
                 if useAppend {
                     do {
-                        return try transfer(append: true, seekTo: offset)
+                        sentBytes = try transfer(append: true, seekTo: offset)
                     } catch let e as EngineError {
                         guard case .unsupported = e else { throw e }
                         // APPE 不被支持 → 整传兜底（此时尚未发出任何数据，可安全重来）
-                        return try transfer(append: false, seekTo: 0)
+                        sentBytes = try transfer(append: false, seekTo: 0)
                     }
+                } else {
+                    sentBytes = try transfer(append: false, seekTo: 0)
                 }
-                return try transfer(append: false, seekTo: 0)
+                // 上传后校验：SIZE 可用时远端必须与本地一致——防服务端静默截断
+                //（FAT32 单文件 4GB 上限/磁盘满/嵌入式服务器怪癖），与下载侧完整性校验对称。
+                if let remoteFinal = (try? conn.remoteSize(remote)) ?? nil, remoteFinal != localSize {
+                    try? conn.deleteFile(remote) // 尽力清掉坏文件，避免重试 APPE 拼接
+                    throw EngineError.ioError("上传校验失败：远端 \(remoteFinal) 字节 ≠ 本地 \(localSize) 字节")
+                }
+                return sentBytes
             }
         }, completion: completion)
     }

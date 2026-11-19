@@ -566,7 +566,10 @@ final class QueueService {
         items[idx].remoteDir = dir
         items[idx].remotePath = dir == "/" ? "/" + unique : dir + "/" + unique
         items[idx].needsNameMapping = needsMapping
-        startUpload(id, handle: handle, resumeOverride: nil)
+        // 首传强制整传 STOR（resume=false）：resume=true 时同名旧文件更小会被 APPE 拼接出坏文件
+        // （首传撞名只可能覆盖，覆盖后是完整好文件；拼接是双输）。续传（重试/暂停恢复/重启恢复，
+        // 走 remotePath != nil 分支）才开 APPE——那时远端半截确为本任务文件的前缀。
+        startUpload(id, handle: handle, resumeOverride: false)
     }
 
     private func startUpload(_ id: String, handle: TransferHandle, resumeOverride: Bool? = nil) {
