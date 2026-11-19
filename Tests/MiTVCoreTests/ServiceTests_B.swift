@@ -13,6 +13,7 @@ enum ServiceTests_B {
         testTVStoreRoundTrip()
         testQueueServiceIntegration()
         testUploadCollision()
+        testBrowseFilter()
     }
 
     // MARK: - 队列状态机
@@ -377,6 +378,29 @@ enum ServiceTests_B {
         let restoredItem = restored.snapshot().first { $0.phase == .queued }
         assertTrue(restoredItem != nil, "running 项恢复为 queued（等待续传）")
         assertEqual(restoredItem?.displayName, f1.lastPathComponent, "恢复项信息完整")
+    }
+}
+
+// MARK: - 浏览隐藏文件过滤（对普通用户隐藏系统自建项）
+
+extension ServiceTests_B {
+
+    static func testBrowseFilter() {
+        print("· 浏览隐藏文件过滤")
+        assertTrue(BrowseFilter.isVisible("Movies"), "普通目录可见")
+        assertTrue(BrowseFilter.isVisible("周岁生日.mp4"), "中文名可见")
+        assertTrue(BrowseFilter.isVisible("Found Treasures"), "found 开头普通目录不误伤")
+        assertTrue(BrowseFilter.isVisible("使用说明.txt"), "普通文件可见")
+        assertFalse(BrowseFilter.isVisible(".fseventsd"), "POSIX 隐藏目录")
+        assertFalse(BrowseFilter.isVisible(".Spotlight-V100"), "macOS 索引目录")
+        assertFalse(BrowseFilter.isVisible("._星际迷航.mp4"), "AppleDouble 资源文件")
+        assertFalse(BrowseFilter.isVisible(".MITV-Trash"), "回收站本体隐藏（入口按本地记账呈现）")
+        assertFalse(BrowseFilter.isVisible("System Volume Information"), "Windows 卷信息")
+        assertFalse(BrowseFilter.isVisible("$RECYCLE.BIN"), "Windows 回收站（大写）")
+        assertFalse(BrowseFilter.isVisible("$recycle.bin"), "Windows 回收站（小写）")
+        assertFalse(BrowseFilter.isVisible("lost.dir"), "Android 丢失目录")
+        assertFalse(BrowseFilter.isVisible("FOUND.000"), "Windows 检查点")
+        assertFalse(BrowseFilter.isVisible("found.007"), "检查点编号系列")
     }
 }
 

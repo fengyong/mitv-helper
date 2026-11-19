@@ -155,10 +155,8 @@ final class TVBrowserView: NSView {
             self.spinner.stopAnimation(nil)
             switch result {
             case .success(let entries):
-                // 隐藏回收站本体与前缀回收文件（由「回收站」入口呈现）
-                let visible = entries.filter { e in
-                    !e.name.hasPrefix(".MITV-Trash")
-                }
+                // 隐藏文件/系统目录对普通用户无意义，不展示；回收站本体（. 开头）同样被隐藏，由「回收站」入口呈现
+                let visible = BrowseFilter.filter(entries)
                 self.entries = visible
                 self.trashRecords = []
                 self.selected = self.selected.intersection(Set(visible.map { $0.path }))

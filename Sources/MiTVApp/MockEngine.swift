@@ -59,6 +59,10 @@ final class MockEngine: TransferEngine {
             parent.children.append(n)
             return n
         }
+        // 隐藏系统项（验证 BrowseFilter 对 UI 生效）
+        _ = add(root, ".fseventsd", isDir: true)
+        _ = add(root, "System Volume Information", isDir: true)
+        _ = add(root, "$RECYCLE.BIN", isDir: true)
         let movies = add(root, "Movies", isDir: true)
         _ = add(movies, "周岁生日宴.mp4", isDir: false, size: 812_000_000)
         _ = add(movies, "毕业旅行 Vlog.mp4", isDir: false, size: 1_280_000_000)

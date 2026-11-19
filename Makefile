@@ -17,6 +17,7 @@ TESTS  := $(wildcard Tests/MiTVCoreTests/*.swift)
 # ServiceTests_B 直测的服务层纯逻辑文件（正式纳入替代临时符号链接方案）
 APP_SERVICE := Sources/MiTVApp/QueueModel.swift Sources/MiTVApp/QueueService.swift \
                Sources/MiTVApp/SmartRouting.swift Sources/MiTVApp/SoftDeletePolicy.swift \
+               Sources/MiTVApp/BrowseFilter.swift \
                Sources/MiTVApp/TVStore.swift
 
 .PHONY: all app cli test appbundle clean typecheck
