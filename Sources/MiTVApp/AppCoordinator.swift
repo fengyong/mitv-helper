@@ -58,6 +58,9 @@ final class AppCoordinator: NSObject {
     /// 「删除前先下载」的批次登记：batchId → (待删文件, 完成回调)。整批取回成功后才执行删除
     private var pendingDeleteBatches: [String: (files: [FTPFileEntry], after: () -> Void)] = [:]
 
+    /// 确认浮层/首连向导是否在场（浏览器键盘监听据此让路，review D4）
+    var hasModalOverlay: Bool { onboarding != nil || confirmOverlay != nil }
+
     // MARK: - Init
 
     override init() {
@@ -576,10 +579,12 @@ final class AppCoordinator: NSObject {
     /// 删除确认浮层（软删除/直删/不支持 三种文案，见 §7）
     func confirmDelete(_ entries: [FTPFileEntry], completion: @escaping () -> Void) {
         let strategy = files.currentStrategy()
-        confirmOverlay = ConfirmOverlay.show(entries: entries, strategy: strategy, in: rootDrop) { [weak self] downloadFirst in
+        let overlay = ConfirmOverlay.show(entries: entries, strategy: strategy, in: rootDrop) { [weak self] downloadFirst in
             guard let self = self else { return }
             self.performDelete(entries, downloadFirst: downloadFirst, after: completion)
         }
+        overlay.dismissCompletion = { [weak self] in self?.confirmOverlay = nil }
+        confirmOverlay = overlay
     }
 
     private func performDelete(_ entries: [FTPFileEntry], downloadFirst: Bool, after: @escaping () -> Void) {
@@ -617,8 +622,13 @@ final class AppCoordinator: NSObject {
                     self.showToast(text, undo: { [weak self] in
                         self?.files.restore(outcome.records,
                                             progress: { _, _, _ in }) { restored, failed in
-                            if restored > 0 { self?.showToast("已还原 \(restored) 项") }
-                            if failed > 0 { self?.showToast("有 \(failed) 项还原失败") }
+                            guard let self = self else { return }
+                            if restored > 0 { self.showToast("已还原 \(restored) 项") }
+                            if failed > 0 { self.showToast("有 \(failed) 项还原失败") }
+                            // 撤销后刷新界面（review D2）：不刷的话文件已回来但列表缺失，用户会以为撤销失败
+                            if self.mode == .browser {
+                                self.browserView.reloadAfterRestore()
+                            }
                         }
                     })
                 } else if outcome.failedNames.isEmpty {
@@ -637,13 +647,14 @@ final class AppCoordinator: NSObject {
 
     // MARK: - 浏览态下载
 
-    func downloadEntries(_ entries: [FTPFileEntry]) {
-        guard !entries.isEmpty else { return }
+    func downloadEntries(_ entries: [FTPFileEntry], completion: ((Bool) -> Void)? = nil) {
+        guard !entries.isEmpty else { completion?(false); return }
         picks.chooseFolder(on: window) { [weak self] dir in
-            guard let self = self, let dir = dir else { return }
+            guard let self = self, let dir = dir else { completion?(false); return }
             self.queue.addDownloads(entries, toDirectory: dir)
             self.setMode(.home)
             self.showToast("已加入取回队列 \(entries.count) 项")
+            completion?(true)
         }
     }
 }

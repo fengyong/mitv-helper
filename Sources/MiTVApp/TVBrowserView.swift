@@ -16,6 +16,8 @@ final class TVBrowserView: NSView {
     private var selected: Set<String> = []
     private var anchorIndex: Int?
     private var loadedOnce = false
+    /// 列表请求序号：晚到的旧回调不得冲掉当前视图（慢网络下进回收站会被冲空，review D5）
+    private var loadEpoch = 0
 
     // 视图
     private let backButton: NSButton
@@ -149,9 +151,12 @@ final class TVBrowserView: NSView {
         loadedOnce = true
         if let p = newPath { path = p; coordinator.store.setLastRemotePath(p) }
         isTrashMode = false
+        loadEpoch += 1
+        let epoch = loadEpoch
         spinner.startAnimation(nil)
         files.list(path) { [weak self] result in
             guard let self = self else { return }
+            guard epoch == self.loadEpoch else { return } // 过期回调（用户已进回收站/已换目录）
             self.spinner.stopAnimation(nil)
             switch result {
             case .success(let entries):
@@ -174,9 +179,17 @@ final class TVBrowserView: NSView {
     /// 回收站视图（用本地记账还原列表）
     private func enterTrash() {
         guard coordinator.trashStore.count > 0 else {
+            // 空回收站也要清视图状态（review D3）：否则还原后残留幽灵列表，再点还原误报失败
             coordinator.showToast("回收站是空的")
+            trashRecords = []
+            selected = []
+            anchorIndex = nil
+            refreshChrome()
+            collection.reloadData()
+            updateActionBar()
             return
         }
+        loadEpoch += 1 // 作废在途目录列表回调（防冲掉回收站视图）
         isTrashMode = true
         spinner.stopAnimation(nil)
         trashRecords = coordinator.trashStore.records.sorted { $0.deletedAt > $1.deletedAt }
@@ -330,8 +343,10 @@ final class TVBrowserView: NSView {
     private func downloadSelected() {
         let entries = selectedEntries()
         guard !entries.isEmpty else { return }
-        clearSelection()
-        coordinator.downloadEntries(entries)
+        coordinator.downloadEntries(entries) { [weak self] didStart in
+            // 用户取消保存目录面板时保留选择（review E2），可重选目录或改主意
+            if didStart { self?.clearSelection() }
+        }
     }
 
     func deleteSelected() {
@@ -360,6 +375,15 @@ final class TVBrowserView: NSView {
     }
 
     // MARK: 冒烟辅助（仅供自动化验证交互路径）
+
+    /// 撤销还原后的刷新：回收站视图重拉本地记账，浏览态重拉远端目录（review D2）
+    func reloadAfterRestore() {
+        if isTrashMode {
+            enterTrash()
+        } else {
+            reload()
+        }
+    }
 
     /// 冒烟：进入第一个目录（验证面包屑让位 + 返回按钮可点）；等列表返回再进
     func smokeEnterFirstDirectory() {
@@ -450,6 +474,7 @@ final class TVBrowserView: NSView {
                 guard let self = self,
                       event.window === self.window, // 只拦本窗口的按键，别吞掉 sheet 里的 Esc
                       self.superview != nil,
+                      !self.coordinator.hasModalOverlay, // 确认浮层/向导在场时不拦（review D4：⌫ 叠框/Esc 吞掉）
                       !(self.window?.firstResponder is NSTextView) else { return event }
                 let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
                 if flags == [.command], event.charactersIgnoringModifiers == "a" {
@@ -606,7 +631,8 @@ final class TVFileCell: NSCollectionViewItem {
     func configureTrash(record: TrashStore.Record, selected: Bool, onSelect: @escaping () -> Void, onShift: @escaping () -> Void) {
         identifierKey = record.id
         nameLabel.stringValue = record.name
-        subLabel.stringValue = "原位置：\((record.originalPath as NSString).deletingLastPathComponent.replacingOccurrences(of: "/", with: ""))"
+        let parent = (record.originalPath as NSString).deletingLastPathComponent
+        subLabel.stringValue = parent == "/" ? "原位置：根目录" : "原位置：\(parent)"
         thumbView.image = LocalThumbnailLoader.fallbackIcon(for: MediaKind.of(fileName: record.name))
         thumbView.contentTintColor = .quaternaryLabelColor
         self.onSelect = onSelect

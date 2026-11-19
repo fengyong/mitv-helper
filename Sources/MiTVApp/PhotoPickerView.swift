@@ -446,9 +446,17 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
             bar.setExportProgress("正在导出 \(i + 1)/\(ids.count)…")
 
             let resources = PHAssetResource.assetResources(for: asset)
-            let resource = bestResource(for: asset, resources: resources)
+            guard let resource = bestResource(for: asset, resources: resources) else {
+                failed += 1 // 个别资产同步中/iCloud 异常会返回空资源列表（review S3）
+                exportOne(i + 1)
+                return
+            }
+            // 保留原文件名（review D1）：电视上按名字可辨认；重名由 StagingStore.uniquedURL 顺延
+            let originalName = resource.originalFilename
             let ext = PhotoPickerController.extension(for: resource)
-            let tmpFile = tmpDir.appendingPathComponent("export-\(i).\(ext)")
+            let safeBase = originalName.isEmpty ? "export-\(i)" : (originalName as NSString).deletingPathExtension
+            let safeExt = (originalName as NSString).pathExtension.isEmpty ? ext : (originalName as NSString).pathExtension
+            let tmpFile = tmpDir.appendingPathComponent("\(safeBase).\(safeExt)")
             let options = PHAssetResourceRequestOptions()
             options.isNetworkAccessAllowed = true // iCloud 原件
             PHAssetResourceManager.default().writeData(for: resource, toFile: tmpFile, options: options) { error in
@@ -471,16 +479,16 @@ final class PhotoPickerController: NSObject, NSCollectionViewDataSource, NSColle
         exportOne(0)
     }
 
-    /// 原文件资源：照片 fullSizePhoto>photo；视频 fullSizeVideo>video；排除 Live Photo 配对视频
-    private func bestResource(for asset: PHAsset, resources: [PHAssetResource]) -> PHAssetResource {
+    /// 原文件资源：照片 fullSizePhoto>photo；视频 fullSizeVideo>video；排除 Live Photo 配对视频。空资源列表返回 nil
+    private func bestResource(for asset: PHAsset, resources: [PHAssetResource]) -> PHAssetResource? {
         if asset.mediaType == .video {
             return resources.first { $0.type == .fullSizeVideo }
                 ?? resources.first { $0.type == .video }
-                ?? resources.first!
+                ?? resources.first
         }
         return resources.first { $0.type == .fullSizePhoto }
             ?? resources.first { $0.type == .photo }
-            ?? resources.first!
+            ?? resources.first
     }
 
     static func `extension`(for resource: PHAssetResource) -> String {

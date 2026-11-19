@@ -170,7 +170,8 @@ final class ConfirmOverlay: NSView {
     /// disabled 策略（电视不支持删除）：确认按钮只做提示关闭，不触发删除流程
     private var notifyOnly = false
     private var downloadFirst = false
-    private var dismissCompletion: (() -> Void)?
+    /// 浮层移除后回调（协调器用它清 confirmOverlay 引用，否则键盘监听守卫永真）
+    var dismissCompletion: (() -> Void)?
 
     private let titleLabel = UIUtil.label("", size: 16, weight: .semibold, align: .center)
     private let subLabel = UIUtil.label("", size: 13, color: .secondaryLabelColor, align: .center)
@@ -307,6 +308,7 @@ final class ConfirmOverlay: NSView {
             animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             self?.removeFromSuperview()
+            self?.dismissCompletion?()
         })
     }
 

@@ -126,9 +126,9 @@ final class QueueService {
         let batch = UUID().uuidString
         let fm = FileManager.default
         var usedNames = Set<String>()
-        let created: [QueueItem] = entries.compactMap { entry in
+        // 先按「本批 + 磁盘已有」预去重构造；最终唯一化在 stateQ 内并入队列级 inflight（跨批次重名，review D6）
+        var created: [QueueItem] = entries.compactMap { entry in
             guard !entry.isDirectory else { return nil }
-            // 本地重名顺延：同批去重 + 目标目录已存在时顺延
             var unique = NameCodec.uniqued(entry.name, existing: usedNames)
             if fm.fileExists(atPath: dir.appendingPathComponent(unique).path) {
                 var i = 2
@@ -150,6 +150,26 @@ final class QueueService {
         }
         guard !created.isEmpty else { return [] }
         stateQ.sync {
+            // 跨批次互斥：未终结下载项已占用的本地路径不可复用（截断式下载会互相毁掉）
+            let inflight = Set(items.filter { $0.direction == .download && !$0.phase.isTerminal }.map { $0.localPath })
+            for i in created.indices {
+                if inflight.contains(created[i].localPath) {
+                    var unique = (created[i].localPath as NSString).lastPathComponent
+                    var k = 2
+                    let stem = (unique as NSString).deletingPathExtension
+                    let ext = (unique as NSString).pathExtension
+                    while true {
+                        let next = ext.isEmpty ? "\(stem) (\(k))" : "\(stem) (\(k)).\(ext)"
+                        let cand = dir.appendingPathComponent(next).path
+                        if !inflight.contains(cand) && !fm.fileExists(atPath: cand) {
+                            unique = next
+                            created[i].localPath = cand
+                            break
+                        }
+                        k += 1
+                    }
+                }
+            }
             items.append(contentsOf: created)
             persistLocked(force: true)
             notifyChange()
@@ -178,7 +198,8 @@ final class QueueService {
 
     func resumeAllByUser() {
         stateQ.sync {
-            guard hold == .user else { return }
+            // 用户点「全部继续」= 明确意图，无论 hold 处于 .user / .disconnected / .none 都生效
+            // （旧实现 guard hold == .user：断线流程覆盖 hold 后按钮永久失效，review D8）
             hold = .none
             for i in items.indices where items[i].phase == .paused {
                 items[i] = QueueStateMachine.apply(.resume, to: items[i])
@@ -471,15 +492,54 @@ final class QueueService {
         }
     }
 
-    /// 列表不可得时的降级：目标定死为 dir，原名直传（无重名判定——可用性优先于覆盖保护）
+    /// 列表不可得时的降级（review D0 修复）：先 engine.size 探同名——
+    /// 不存在（或 SIZE 不可用）→ 原名直传；已存在 → 指纹后缀改名。
+    /// 降级路径一律禁用 APPE：若旧同名文件更小，SIZE+APPE 会把新内容追加到旧文件尾部产出坏文件
     private func startUploadWithFallback(_ id: String, dir: String, handle: TransferHandle) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
         guard items[idx].phase == .connecting else { return }
+        guard let endpoint = endpointProvider() else {
+            finishWithEngineError(id: id, error: EngineError.notConnected)
+            return
+        }
         let mapped = NameCodec.remoteName(for: items[idx].displayName)
+        let targetPath = dir == "/" ? "/" + mapped.remote : dir + "/" + mapped.remote
+        let localSize = items[idx].sizeBytes
+        let localURL = items[idx].localURL
+        engineProvider().size(endpoint, remotePath: targetPath) { [weak self] sizeResult in
+            guard let self = self else { return }
+            self.stateQ.async {
+                guard let idx = self.items.firstIndex(where: { $0.id == id }),
+                      self.items[idx].phase == .connecting else { return }
+                // nil = 不存在或 SIZE 不可用（如真机 SIZE=false）→ 原名直传
+                guard let remoteSize = (try? sizeResult.get()) ?? nil, remoteSize > 0 else {
+                    self.commitFallbackUpload(id: id, dir: dir, finalName: mapped.remote,
+                                              needsMapping: mapped.needsMapping, resume: false, handle: handle)
+                    return
+                }
+                // 同名已存在 → 本地指纹后缀改名（背景计算指纹）
+                FileDigest.fingerprintAsync(url: localURL, fileSize: localSize) { [weak self] hex, _ in
+                    guard let self = self else { return }
+                    self.stateQ.async {
+                        let digest8 = hex.map { String($0.prefix(8)) }
+                            ?? String(format: "%08x", UInt32(truncatingIfNeeded: localSize))
+                        self.commitFallbackUpload(id: id, dir: dir,
+                                                  finalName: SmartRouting.md5SuffixedName(mapped.remote, digest8: digest8),
+                                                  needsMapping: mapped.needsMapping, resume: false, handle: handle)
+                    }
+                }
+            }
+        }
+    }
+
+    private func commitFallbackUpload(id: String, dir: String, finalName: String,
+                                      needsMapping: Bool, resume: Bool, handle: TransferHandle) {
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        guard items[idx].phase == .connecting else { return }
         items[idx].remoteDir = dir
-        items[idx].remotePath = dir == "/" ? "/" + mapped.remote : dir + "/" + mapped.remote
-        items[idx].needsNameMapping = mapped.needsMapping
-        startUpload(id, handle: handle)
+        items[idx].remotePath = dir == "/" ? "/" + finalName : dir + "/" + finalName
+        items[idx].needsNameMapping = needsMapping
+        startUpload(id, handle: handle, resumeOverride: resume)
     }
 
     /// 相同文件：不传输，直接标记完成并说明原因
@@ -506,10 +566,10 @@ final class QueueService {
         items[idx].remoteDir = dir
         items[idx].remotePath = dir == "/" ? "/" + unique : dir + "/" + unique
         items[idx].needsNameMapping = needsMapping
-        startUpload(id, handle: handle)
+        startUpload(id, handle: handle, resumeOverride: nil)
     }
 
-    private func startUpload(_ id: String, handle: TransferHandle) {
+    private func startUpload(_ id: String, handle: TransferHandle, resumeOverride: Bool? = nil) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
         guard items[idx].phase == .connecting else { return } // 可能已被暂停/取消
         guard let target = items[idx].remotePath else {
@@ -525,7 +585,8 @@ final class QueueService {
         persistLocked()
         notifyChange()
 
-        let resume = capabilitiesProvider()?.appeResume == true
+        // resumeOverride：降级路径强制 false（STOR 整传，防 APPE 拼接旧文件）
+        let resume = resumeOverride ?? (capabilitiesProvider()?.appeResume == true)
         engineProvider().upload(endpoint,
                                 from: items[idx].localURL,
                                 to: target,
@@ -614,15 +675,20 @@ final class QueueService {
     }
 
     private func notifyChange() {
+        // 批量完成判定必须每次无条件执行（review S2）：若藏在 notifyPending 合并守卫后面，
+        // 终态回调与最终进度背靠背到达时 onBatchCompleted 会丢失/延迟（「删除前先下载」依赖它）
+        checkBatchCompletions()
         guard !notifyPending else { return }
         notifyPending = true
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.notifyPending = false
-            // 批量完成检查也借主队列回调触发
             self.onChanged?()
         }
-        // 批量完成判定在状态队列上做（用最新状态）
+    }
+
+    /// 批量完成判定（stateQ 上执行，用最新状态）
+    private func checkBatchCompletions() {
         let batchIDs = Set(items.map { $0.batchId })
         for b in batchIDs {
             let members = items.filter { $0.batchId == b }

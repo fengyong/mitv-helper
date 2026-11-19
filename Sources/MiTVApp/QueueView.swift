@@ -478,7 +478,8 @@ final class QueueCardView: NSView {
             progress.barColor = .systemRed
             progress.fraction = item.sizeBytes > 0 ? Double(item.bytes) / Double(item.sizeBytes) : 0
             statusLabel.textColor = .systemRed
-            statusLabel.stringValue = "发送失败 · \(item.failureReason ?? "未知原因")"
+            statusLabel.stringValue = (item.direction == .download ? "取回失败 · " : "发送失败 · ")
+                + (item.failureReason ?? "未知原因")
         case .completed:
             progress.isHidden = false
             progress.fraction = 1

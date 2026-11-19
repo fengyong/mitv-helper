@@ -230,6 +230,8 @@ enum ServiceTests_B {
         var failListPath: String?
         /// MKD 是否成功（真机 SwiFTP 550 → false）
         var allowMKD = false
+        /// size() 按路径返回预设值（降级同名探测测试用）；未命中 → success(nil)
+        var remoteSizes: [String: Int64] = [:]
         /// downloadPrefix 返回的「远端前缀」内容（nil → 失败）
         var remotePrefix: Data?
         private var prefixCallCount = 0
@@ -295,7 +297,9 @@ enum ServiceTests_B {
         func makeDirectory(_ endpoint: FTPEndpoint, path: String, completion: @escaping (Error?) -> Void) {
             DispatchQueue.global().async { completion(self.allowMKD ? nil : EngineError.unsupported("MKD")) }
         }
-        func size(_ endpoint: FTPEndpoint, remotePath: String, completion: @escaping (Result<Int64?, Error>) -> Void) { DispatchQueue.global().async { completion(.success(nil)) } }
+        func size(_ endpoint: FTPEndpoint, remotePath: String, completion: @escaping (Result<Int64?, Error>) -> Void) {
+            DispatchQueue.global().async { completion(.success(self.remoteSizes[remotePath])) }
+        }
         func probeCapabilities(_ endpoint: FTPEndpoint, completion: @escaping (Result<Capabilities, Error>) -> Void) {
             DispatchQueue.global().async { completion(.success(Capabilities())) }
         }
@@ -515,6 +519,34 @@ extension ServiceTests_B {
             queue.addUploads([f1])
             waitUntil("空盘 MKD 被拒 → 回根直传") { queue.snapshot().first?.phase == .completed }
             assertEqual(engine.uploadCalls.first?.remotePath, "/" + fname, "MKD 拒 → 根目录原名")
+        }
+
+        // 4) 列表失败 + SIZE 显示同名已存在（review D0）→ 指纹名改名 + 禁 APPE（防拼接）
+        do {
+            let engine = InlineEngine()
+            engine.failAllLists = true
+            engine.remoteSizes = ["/" + fname: 999999] // 远端恰有同名旧文件
+            let queue = makeQueue("d0clash", engine)
+            queue.addUploads([f1])
+            waitUntil("降级同名冲突 → 指纹名") { queue.snapshot().first?.phase == .completed }
+            let call = engine.uploadCalls.first
+            assertTrue(call != nil, "仍发起上传")
+            assertFalse(call?.resume ?? true, "降级路径禁 APPE（防旧文件尾部拼接坏文件）")
+            assertTrue(call?.remotePath != "/" + fname, "不覆盖远端同名旧文件")
+            let rp = call?.remotePath ?? ""
+            assertTrue(rp.hasPrefix("/") && rp.contains("-"), "改用指纹后缀名")
+        }
+
+        // 5) 列表失败 + SIZE 不可用（nil：不存在或 SIZE=false）→ 原名直传 + 禁 APPE
+        do {
+            let engine = InlineEngine()
+            engine.failAllLists = true
+            let queue = makeQueue("d0noclash", engine)
+            queue.addUploads([f1])
+            waitUntil("降级无同名 → 原名直传") { queue.snapshot().first?.phase == .completed }
+            let call = engine.uploadCalls.first
+            assertEqual(call?.remotePath, "/" + fname, "无同名 → 原名")
+            assertFalse(call?.resume ?? true, "降级路径禁 APPE")
         }
     }
 }

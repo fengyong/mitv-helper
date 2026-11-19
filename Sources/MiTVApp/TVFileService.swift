@@ -138,7 +138,20 @@ final class TVFileService {
         // 软删除：先确保回收站目录存在（mkdir 可用则尝试建；不行则前缀形态兜底）
         func beginSoftDelete() {
             let doPrefix: () -> Void = { self.softDelete(files, form: .prefix, endpoint: endpoint, engine: engine, progress: progress, completion: completion) }
-            let doDirectory: () -> Void = { self.softDelete(files, form: .directory, endpoint: endpoint, engine: engine, progress: progress, completion: completion) }
+            // 目录形态需要 /.MITV-Trash/<扁平化父目录> 存在（review B2）：逐个尽力 MKD（失败继续——可能已存在，真失败由 move 上报）
+            let parentNames = Set(files.map { SoftDeletePolicy.flattenParent(ofPath: $0.path) }.filter { !$0.isEmpty })
+            let doDirectory: () -> Void = {
+                guard !parentNames.isEmpty else { self.softDelete(files, form: .directory, endpoint: endpoint, engine: engine, progress: progress, completion: completion); return }
+                var remaining = parentNames
+                func mkNext() {
+                    if let name = remaining.popFirst() {
+                        engine.makeDirectory(endpoint, path: SoftDeletePolicy.trashRoot + "/" + name) { _ in mkNext() }
+                    } else {
+                        self.softDelete(files, form: .directory, endpoint: endpoint, engine: engine, progress: progress, completion: completion)
+                    }
+                }
+                mkNext()
+            }
             if caps.mkdir {
                 engine.makeDirectory(endpoint, path: SoftDeletePolicy.trashRoot) { _ in
                     // 无论 mkdir 成败，都用 list 验证目录是否存在（可能早已存在）
@@ -278,6 +291,7 @@ final class TVFileService {
 
     private let thumbCache = NSCache<NSString, NSImage>()
     private var fetchingPaths = Set<String>()
+    private var failedThumbs = Set<String>()
     private let fetchLock = NSLock()
     private let maxThumbBytes: Int64 = 20 * 1024 * 1024
 
@@ -300,12 +314,20 @@ final class TVFileService {
             completion(cached)
             return
         }
+        // 负缓存：失败一次本会话内不再重试（防每次浏览都重下大图）
         fetchLock.lock()
-        if fetchingPaths.contains(entry.path) { fetchLock.unlock(); completion(nil); return }
+        if failedThumbs.contains(entry.path) || fetchingPaths.contains(entry.path) {
+            fetchLock.unlock()
+            completion(nil)
+            return
+        }
         fetchingPaths.insert(entry.path)
         fetchLock.unlock()
 
-        let localURL = thumbDir.appendingPathComponent(entry.path.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? UUID().uuidString)
+        // 缓存文件名用路径哈希：中文长路径的 percent-encoding 可超 NAME_MAX=255 导致永不落盘（review D7）
+        let ext = (entry.name as NSString).pathExtension
+        let hashed = FileDigest.md5Hex(Data(entry.path.utf8)) + (ext.isEmpty ? "" : "." + ext)
+        let localURL = thumbDir.appendingPathComponent(hashed)
         guard let endpoint = endpointProvider() else {
             markNotFetching(entry.path); completion(nil); return
         }
@@ -319,6 +341,9 @@ final class TVFileService {
                 try? FileManager.default.removeItem(at: localURL)
                 DispatchQueue.main.async { completion(thumb) }
             } else {
+                self.fetchLock.lock()
+                self.failedThumbs.insert(entry.path)
+                self.fetchLock.unlock()
                 try? FileManager.default.removeItem(at: localURL)
                 DispatchQueue.main.async { completion(nil) }
             }
