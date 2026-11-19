@@ -26,6 +26,8 @@ enum ServiceTests_B {
         testThumbFetchSafety()
         testUploadTargetPersistence()
         testQueueItemDirOverrideRoundTrip()
+        testExplicitTargetDirRouting()
+        testCustomTargetDegradation()
     }
 
     // MARK: - 队列状态机
@@ -250,6 +252,8 @@ enum ServiceTests_B {
         var pendingDownloadCompletions: [(Result<Int64, Error>) -> Void] = []
         /// 指定路径的 list 以失败收场（目录存在但列不出内容的怪癖模拟）
         var failListPath: String?
+        /// 指定路径前 N 次 list 失败、之后成功（指定目录「首列失败 → MKD 重建 → 再列成功」测试用）
+        var listFailCounts: [String: Int] = [:]
         /// MKD 是否成功（真机 SwiFTP 550 → false）
         var allowMKD = false
         /// size() 按路径返回预设值（降级同名探测测试用）；未命中 → success(nil)
@@ -268,6 +272,7 @@ enum ServiceTests_B {
         private let lock = NSLock()
 
         var prefixCalls: Int { lock.lock(); defer { lock.unlock() }; return prefixCallCount }
+        var listCalls: Int { lock.lock(); defer { lock.unlock() }; return listCallCount }
 
         func releaseAllUploads(_ result: Result<Int64, Error>) {
             lock.lock(); let cbs = pendingUploadCompletions; pendingUploadCompletions = []; lock.unlock()
@@ -298,6 +303,18 @@ enum ServiceTests_B {
             DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
                 if self.failAllLists {
                     completion(.failure(EngineError.connectionFailed("模拟列表失败")))
+                    return
+                }
+                // 按路径的「前 N 次失败」脚本：MKD 重建后同一路径再列即成功
+                var remainingFail = 0
+                self.lock.lock()
+                if let c = self.listFailCounts[path], c > 0 {
+                    self.listFailCounts[path] = c - 1
+                    remainingFail = c
+                }
+                self.lock.unlock()
+                if remainingFail > 0 {
+                    completion(.failure(EngineError.connectionFailed("模拟目录列表失败")))
                     return
                 }
                 if let p = self.failListPath, p == path {
@@ -1355,6 +1372,149 @@ extension ServiceTests_B {
             let p1 = engine.uploadCalls[1].remotePath.lowercased()
             assertTrue(p0 != p1, "降级定名同样要查已完成兄弟项占名")
             queue.suspendForShutdown()
+        }
+    }
+}
+
+// MARK: - 指定存放位置上传（设计稿 docs/20261119_design_upload_target.md v2 §6.1 两层解析 + §6.3 失效降级）
+
+extension ServiceTests_B {
+
+    /// 构造：单并发队列 + 注入全局指定目录（AppCoordinator 场景：targetDirProvider 读 TVStore 快照）
+    static func makeTargetQueue(_ engine: InlineEngine, _ dir: URL, global: String?) -> QueueService {
+        let q = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                             capabilitiesProvider: { Capabilities() },
+                             persistenceDirectory: dir, concurrency: 1, resumeOnStart: true)
+        q.targetDirProvider = { global }
+        return q
+    }
+
+    static func testExplicitTargetDirRouting() {
+        print("· 指定存放位置：两层解析与混合批次")
+        let base = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-expr-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let fv = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-expr-v-\(UUID().uuidString).mp4")
+        try! Data(repeating: 1, count: 64).write(to: fv)
+        defer { try? FileManager.default.removeItem(at: fv) }
+        let fi = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-expr-i-\(UUID().uuidString).jpg")
+        try! Data(repeating: 2, count: 64).write(to: fi)
+        defer { try? FileManager.default.removeItem(at: fi) }
+        let fo = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-expr-o-\(UUID().uuidString).txt")
+        try! Data(repeating: 3, count: 64).write(to: fo)
+        defer { try? FileManager.default.removeItem(at: fo) }
+
+        // 1) 批级目标（深层目录）直列：跳过根 LIST，落指定目录
+        do {
+            let engine = InlineEngine()
+            let target = "/剧集/庆余年2"
+            engine.dirEntriesByPath[target] = []
+            let q = makeTargetQueue(engine, base.appendingPathComponent("t1"), global: nil)
+            let items = q.addUploads([fv], targetDir: target)
+            assertEqual(items.first?.dirOverride, target, "批级目标写入任务项 dirOverride")
+            waitUntil("批级目标上传完成") { q.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, target + "/" + fv.lastPathComponent, "深层指定目录直列")
+            assertEqual(q.snapshot().first?.remoteDir, target, "卡片目标 = 指定目录")
+            assertEqual(engine.listCalls, 1, "只 LIST 一次（直列目标目录，无根 LIST 前置跳）")
+        }
+
+        // 2) 全局指定 + 混合批次：视频/图片/其他 全部进同一指定目录（设计稿 §6.2）
+        do {
+            let engine = InlineEngine()
+            let target = "/家庭相册"
+            engine.dirEntriesByPath[target] = []
+            let q = makeTargetQueue(engine, base.appendingPathComponent("t2"), global: target)
+            _ = q.addUploads([fv, fi, fo])
+            waitUntil("混合批次全部完成") { q.snapshot().filter { $0.phase == .completed }.count == 3 }
+            for it in q.snapshot() {
+                assertEqual(it.remoteDir, target, "混合批次全部进指定目录（含 .other）")
+            }
+            let dirs = Set(engine.uploadCalls.map { ($0.remotePath as NSString).deletingLastPathComponent })
+            assertEqual(dirs, Set([target]), "引擎层三个文件同目录")
+        }
+
+        // 3) 全局指定根目录：显式「/」= 原名入根
+        do {
+            let engine = InlineEngine()
+            let q = makeTargetQueue(engine, base.appendingPathComponent("t3"), global: "/")
+            _ = q.addUploads([fv])
+            waitUntil("根目录上传完成") { q.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, "/" + fv.lastPathComponent, "指定根目录 = 原名入根")
+            assertEqual(q.snapshot().first?.remoteDir, "/", "卡片显示电视根目录")
+        }
+
+        // 4) 批级目标优先于全局指定（两层解析的任务项层覆盖）
+        do {
+            let engine = InlineEngine()
+            let batchTarget = "/批级"
+            let globalTarget = "/全局"
+            engine.dirEntriesByPath[batchTarget] = []
+            engine.dirEntriesByPath[globalTarget] = []
+            let q = makeTargetQueue(engine, base.appendingPathComponent("t4"), global: globalTarget)
+            _ = q.addUploads([fv], targetDir: batchTarget)
+            waitUntil("批级覆盖完成") { q.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, batchTarget + "/" + fv.lastPathComponent, "批级目标优先于全局指定")
+        }
+    }
+
+    static func testCustomTargetDegradation() {
+        print("· 指定目录失效降级（MKD 兜底 / 回根 + 每批一次告知）")
+        let base = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-deg-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let f1 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-deg-a-\(UUID().uuidString).mp4")
+        try! Data(repeating: 9, count: 64).write(to: f1)
+        defer { try? FileManager.default.removeItem(at: f1) }
+        let f2 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-deg-b-\(UUID().uuidString).mp4")
+        try! Data(repeating: 8, count: 64).write(to: f2)
+        defer { try? FileManager.default.removeItem(at: f2) }
+
+        // 1) 目录消失 + MKD 被拒（真机 550 语义）→ 回根目录 + 每批一次降级告知（D6）
+        do {
+            let engine = InlineEngine()
+            let target = "/没了"
+            engine.failListPath = target
+            engine.allowMKD = false
+            let q = makeTargetQueue(engine, base.appendingPathComponent("d1"), global: nil)
+            let lock = NSLock()
+            var fallbackDirs: [String] = []
+            q.onUploadFallback = { _, dir in lock.lock(); fallbackDirs.append(dir); lock.unlock() }
+            _ = q.addUploads([f1, f2], targetDir: target)
+            waitUntil("两项降级回根完成") { q.snapshot().filter { $0.phase == .completed }.count == 2 }
+            waitMain("降级告知送达主队列") {
+                lock.lock(); let c = fallbackDirs.count; lock.unlock(); return c == 1
+            }
+            assertEqual(fallbackDirs.first, target, "告知携带失效目录")
+            for it in q.snapshot() {
+                assertEqual(it.remoteDir, "/", "失效目录 → 回根（D6 终点）")
+            }
+            let dirs = Set(engine.uploadCalls.map { ($0.remotePath as NSString).deletingLastPathComponent })
+            assertEqual(dirs, Set(["/"]), "两项实际都落在根目录")
+        }
+
+        // 2) 目录消失 + MKD 成功 → 重建后归入指定目录，无降级告知
+        do {
+            let engine = InlineEngine()
+            let target = "/重建"
+            engine.listFailCounts = [target: 1] // 首列失败（目录没了）→ MKD 成功 → 再列成功
+            engine.allowMKD = true
+            let q = makeTargetQueue(engine, base.appendingPathComponent("d2"), global: nil)
+            let lock = NSLock()
+            var fallbackCount = 0
+            q.onUploadFallback = { _, _ in lock.lock(); fallbackCount += 1; lock.unlock() }
+            _ = q.addUploads([f1], targetDir: target)
+            waitUntil("MKD 重建后完成") { q.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, target + "/" + f1.lastPathComponent, "MKD 重建后归入指定目录")
+            waitMain("重建成功不发降级告知") {
+                lock.lock(); let c = fallbackCount; lock.unlock(); return c == 0
+            }
+        }
+
+        // 3) 智能分流回归：未指定时保持现状（视频 → /Movies）
+        do {
+            let engine = InlineEngine()
+            let q = makeTargetQueue(engine, base.appendingPathComponent("d3"), global: nil)
+            _ = q.addUploads([f1])
+            waitUntil("智能分流完成") { q.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, "/Movies/" + f1.lastPathComponent, "未指定 → 智能分流行为不变")
         }
     }
 }

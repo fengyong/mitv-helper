@@ -25,6 +25,11 @@ final class QueueService {
     var onChanged: (() -> Void)?
     /// 一个批量内全部任务终结（completed 数 / 失败+取消数）
     var onBatchCompleted: ((_ batchId: String, _ completed: Int, _ failed: Int) -> Void)?
+    /// 指定目录上传时已失效、降级回根目录后回调（主队列，每批至多一次；供 toast 告知，设计稿 v2 §6.3/D6）
+    var onUploadFallback: ((_ batchId: String, _ dir: String) -> Void)?
+
+    /// 全局指定目录（「存放位置 = 指定位置」）：nil = 智能分类（AppCoordinator 注入 TVStore 快照，设计稿 v2 §6.1）
+    var targetDirProvider: (() -> String?)?
 
     // MARK: 状态（全部仅 stateQ 内访问）
 
@@ -34,6 +39,8 @@ final class QueueService {
     private var batchNotified: Set<String> = []
     private var schedulerHalted = false
     private var hold: HoldReason = .none
+    /// 已发过降级告知的批次（每批至多一次，防整批降级时 toast 刷屏）
+    private var fallbackNotifiedBatches: Set<String> = []
     private var lastPersistAt = Date.distantPast
     private var notifyPending = false
     private var notifyDirty = false
@@ -100,7 +107,7 @@ final class QueueService {
     // MARK: 入队
 
     @discardableResult
-    func addUploads(_ urls: [URL]) -> [QueueItem] {
+    func addUploads(_ urls: [URL], targetDir: String? = nil) -> [QueueItem] {
         let fm = FileManager.default
         let batch = UUID().uuidString
         let created: [QueueItem] = urls.compactMap { url in
@@ -108,9 +115,12 @@ final class QueueService {
             var size: Int64 = 0
             if let attr = try? fm.attributesOfItem(atPath: url.path),
                let n = attr[.size] as? NSNumber { size = n.int64Value }
-            return QueueItem(direction: .upload, kind: MediaKind.of(url: url),
-                             localPath: url.path, displayName: name,
-                             sizeBytes: size, batchId: batch)
+            var it = QueueItem(direction: .upload, kind: MediaKind.of(url: url),
+                               localPath: url.path, displayName: name,
+                               sizeBytes: size, batchId: batch)
+            // 批级目标（「上传到这里」）：入队即写入任务项，随 queue.json 持久化（设计稿 v2 §6.1）
+            if let dir = targetDir { it.dirOverride = dir }
+            return it
         }
         guard !created.isEmpty else { return [] }
         stateQ.sync {
@@ -333,7 +343,14 @@ final class QueueService {
                 startUpload(id, handle: handle)
                 return
             }
-            // 智能分流：先看根目录定目标文件夹
+            // 两层目标解析（设计稿 v2 §6.1）：任务项批级目标（「上传到这里」）> 全局指定位置 > 智能分流。
+            // 指定目录（非根）直列目标目录本身：存在与否以 LIST 结果为准，比智能分流少一次根目录 LIST
+            let explicit = item.dirOverride ?? targetDirProvider?()
+            if let dir = explicit, dir != "/" {
+                listUploadTarget(id, dir: dir, handle: handle)
+                return
+            }
+            // 智能分流（或显式根目录）：先看根目录定目标文件夹（根列表兼作重名判定依据）
             engineProvider().list(endpoint, path: "/") { [weak self] result in
                 guard let self = self else { return }
                 self.stateQ.async { self.chooseUploadDir(id, rootEntries: result, handle: handle) }
@@ -352,7 +369,9 @@ final class QueueService {
             startUploadWithFallback(id, dir: "/", handle: handle)
             return
         }
-        let dir = SmartRouting.destinationDir(kind: items[idx].kind)
+        // 两层解析（设计稿 v2 §6.1）：批级覆盖 / 全局指定 / 智能分流。非根指定目录已在 beginTransfer
+        // 直列目标目录，走到这里只可能是「显式根目录」或「智能分流」
+        let dir = items[idx].dirOverride ?? targetDirProvider?() ?? SmartRouting.destinationDir(kind: items[idx].kind)
         if dir == "/" {
             finalizeUploadRouting(id, dir: dir, dirExisted: true, dirEntries: rootEntries, handle: handle)
             return
@@ -384,6 +403,63 @@ final class QueueService {
                 }
                 self.engineProvider().list(endpoint2, path: dir) { dirResult in
                     self.stateQ.async { self.finalizeUploadRouting(id, dir: dir, dirExisted: false, dirEntries: dirResult, handle: handle) }
+                }
+            }
+        }
+    }
+
+    /// 指定目标目录上传（设计稿 v2 §6.3）：直列该目录；目录不存在 → 尽力 MKD 重建最后一级 →
+    /// 仍失败回退电视根目录（D6）+ onUploadFallback（主队列，每批至多一次防 toast 刷屏）
+    private func listUploadTarget(_ id: String, dir: String, handle: TransferHandle) {
+        guard let endpoint = endpointProvider() else {
+            finishWithEngineError(id: id, error: EngineError.notConnected)
+            return
+        }
+        engineProvider().list(endpoint, path: dir) { [weak self] result in
+            guard let self = self else { return }
+            self.stateQ.async {
+                guard let idx = self.items.firstIndex(where: { $0.id == id }),
+                      self.items[idx].phase == .connecting else { return } // 可能已被暂停/取消
+                if case .success(let entries) = result {
+                    self.finalizeUploadRouting(id, dir: dir, dirExisted: true, dirEntries: .success(entries), handle: handle)
+                } else {
+                    self.recoverUploadTarget(id, dir: dir, handle: handle)
+                }
+            }
+        }
+    }
+
+    /// 指定目录 LIST 失败的兜底：尽力 MKD（支持建目录的设备自动重建）→ LIST；
+    /// 仍失败（真机 MKD 550 等）→ 回根目录 + 每批一次的降级告知
+    private func recoverUploadTarget(_ id: String, dir: String, handle: TransferHandle) {
+        guard let endpoint = endpointProvider() else {
+            finishWithEngineError(id: id, error: EngineError.notConnected)
+            return
+        }
+        engineProvider().makeDirectory(endpoint, path: dir) { [weak self] _ in
+            guard let self = self else { return }
+            self.stateQ.async {
+                guard let idx = self.items.firstIndex(where: { $0.id == id }),
+                      self.items[idx].phase == .connecting,
+                      let endpoint2 = self.endpointProvider() else {
+                    self.finishWithEngineError(id: id, error: EngineError.notConnected)
+                    return
+                }
+                self.engineProvider().list(endpoint2, path: dir) { result in
+                    self.stateQ.async {
+                        guard let idx2 = self.items.firstIndex(where: { $0.id == id }),
+                              self.items[idx2].phase == .connecting else { return }
+                        if case .success(let entries) = result {
+                            self.finalizeUploadRouting(id, dir: dir, dirExisted: false, dirEntries: .success(entries), handle: handle)
+                        } else {
+                            let batchId = self.items[idx2].batchId
+                            if !self.fallbackNotifiedBatches.contains(batchId) {
+                                self.fallbackNotifiedBatches.insert(batchId)
+                                DispatchQueue.main.async { [weak self] in self?.onUploadFallback?(batchId, dir) }
+                            }
+                            self.startUploadWithFallback(id, dir: "/", handle: handle)
+                        }
+                    }
                 }
             }
         }
