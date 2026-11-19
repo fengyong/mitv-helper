@@ -400,24 +400,21 @@ final class QueueService {
             }
             return
         }
-        // 并发互斥：其他未终结上传项在【同一目标目录】已占用的远端名也计入
-        //（各项回调在 stateQ 串行处理，无竞态；跨目录同名不算冲突）
-        let inflight = inflightUploadNames(dir: dir, excluding: id)
         let mapped = NameCodec.remoteName(for: items[idx].displayName)
         // 磁盘上已有同名文件 → 「相同文件」判定（尺寸 → 前 10MB 指纹）
         if let clash = dirList.first(where: { !$0.isDirectory && $0.name.caseInsensitiveCompare(mapped.remote) == .orderedSame }) { // FAT 大小写不敏感
             decideSameFileOrSuffix(id, dir: dir, proposedName: mapped.remote, needsMapping: mapped.needsMapping,
-                                   clash: clash, dirList: dirList, inflight: inflight, handle: handle)
+                                   clash: clash, dirList: dirList, handle: handle)
             return
         }
         beginUpload(id, dir: dir, remoteName: mapped.remote, needsMapping: mapped.needsMapping,
-                    dirList: dirList, inflight: inflight, handle: handle)
+                    dirList: dirList, handle: handle)
     }
 
     /// 同名冲突判定：远端是相同文件 → 跳过上传；不同文件（或判定不了）→ 原名后加内容指纹改名；
     /// 指纹名若也被占用，对它再做一次相同判定（同一内容此前已传过 → 跳过，不堆积 (2)(3)）
     private func decideSameFileOrSuffix(_ id: String, dir: String, proposedName: String, needsMapping: Bool,
-                                        clash: FTPFileEntry, dirList: [FTPFileEntry], inflight: Set<String>,
+                                        clash: FTPFileEntry, dirList: [FTPFileEntry],
                                         handle: TransferHandle) {
         func stillConnecting(_ id: String) -> Bool {
             guard let idx = items.firstIndex(where: { $0.id == id }) else { return false }
@@ -450,13 +447,13 @@ final class QueueService {
                                     self.skipUploadAsDuplicate(id, dir: dir, remotePath: second.path, needsMapping: needsMapping)
                                 } else {
                                     self.beginUpload(id, dir: dir, remoteName: candidate, needsMapping: needsMapping,
-                                                     dirList: dirList, inflight: inflight, handle: handle)
+                                                     dirList: dirList, handle: handle)
                                 }
                             }
                         }
                     } else {
                         self.beginUpload(id, dir: dir, remoteName: candidate, needsMapping: needsMapping,
-                                         dirList: dirList, inflight: inflight, handle: handle)
+                                         dirList: dirList, handle: handle)
                     }
                 }
 
@@ -589,14 +586,16 @@ final class QueueService {
 
     /// 定名（净化名/指纹名 + 重名顺延）→ 起传
     private func beginUpload(_ id: String, dir: String, remoteName: String, needsMapping: Bool,
-                             dirList: [FTPFileEntry], inflight: Set<String>, handle: TransferHandle) {
+                             dirList: [FTPFileEntry], handle: TransferHandle) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
         guard items[idx].phase == .connecting else { return } // 可能已被暂停/取消
         if let dup = completedDuplicatePath(localPath: items[idx].localPath, dir: dir, excluding: id) {
             skipUploadAsDuplicate(id, dir: dir, remotePath: dup, needsMapping: needsMapping)
             return
         }
-        let allNames = SmartRouting.existingNames(entries: dirList).union(inflight)
+        // inflight 必须在此刻现算：clash 判定经过指纹/远端前缀多次异步 hop，
+        // finalize 时的快照里看不见 hop 期间其他项的占位 → 会并发 STOR 同一远端名
+        let allNames = SmartRouting.existingNames(entries: dirList).union(inflightUploadNames(dir: dir, excluding: id))
         // 顺延后缀可能把名字推过 NAME_MAX → 定名后再按 GBK 字节截断
         let unique = NameCodec.capped(NameCodec.uniqued(remoteName, existing: allNames, caseInsensitive: true)).name
         items[idx].remoteDir = dir

@@ -20,6 +20,7 @@ enum ServiceTests_B {
         testDirectDelete()
         testPauseAllCancelsHandles()
         testBatchNameCollisions()
+        testStaleInflightRace()
         testThumbFetchSafety()
     }
 
@@ -247,6 +248,8 @@ enum ServiceTests_B {
         var remoteSizes: [String: Int64] = [:]
         /// downloadPrefix 返回的「远端前缀」内容（nil → 失败）
         var remotePrefix: Data?
+        /// downloadPrefix 回调延迟（拉宽异步窗口，复现过期 inflight 快照竞态用）
+        var prefixDelay: TimeInterval = 0.02
         private var prefixCallCount = 0
         private let lock = NSLock()
 
@@ -291,7 +294,7 @@ enum ServiceTests_B {
             prefixCallCount += 1
             let data = remotePrefix
             lock.unlock()
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.02) {
+            DispatchQueue.global().asyncAfter(deadline: .now() + prefixDelay) {
                 if let d = data { completion(.success(d)) }
                 else { completion(.failure(EngineError.ioError("无预置前缀"))) }
             }
@@ -1074,5 +1077,46 @@ extension ServiceTests_B {
             assertEqual(engine.uploadCalls.count, 1, "同文件重复拖入只传一次")
             assertTrue(queue.snapshot().contains { $0.skippedReason != nil }, "第二份标记跳过")
         }
+    }
+}
+
+// MARK: - 过期 inflight 快照竞态（clash 判定异步 hop 期间另一项已占位）
+
+extension ServiceTests_B {
+
+    /// 同内容两份拷贝（不同 localPath）+ 远端同尺寸不同内容同名文件：
+    /// 两项都走 clash→指纹→远端前缀比对的异步路径，finalizeUploadRouting 时
+    /// 互不见对方占位。beginUpload 若沿用 finalize 时的 inflight 快照，
+    /// 两项会定出同一个指纹名 → 并发 STOR 同一远端路径。
+    static func testStaleInflightRace() {
+        print("· 过期 inflight 快照竞态")
+        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-stale-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let subA = baseDir.appendingPathComponent("A"); let subB = baseDir.appendingPathComponent("B")
+        try? FileManager.default.createDirectory(at: subA, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: subB, withIntermediateDirectories: true)
+        let fa = subA.appendingPathComponent("同名.mp4"); let fb = subB.appendingPathComponent("同名.mp4")
+        try? Data(repeating: 0xAA, count: 16).write(to: fa)
+        try? Data(repeating: 0xAA, count: 16).write(to: fb) // 内容相同的另一份拷贝
+
+        let caps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
+                                mkdir: false, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+        let engine = InlineEngine()
+        engine.dirEntries = [
+            FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true),
+            FTPFileEntry(path: "/Movies/同名.mp4", name: "同名.mp4", isDirectory: false, size: 16),
+        ]
+        engine.remotePrefix = Data(repeating: 0xFF, count: 16) // 同尺寸、不同内容 → 前缀比对判「不同」
+        engine.prefixDelay = 0.3 // 拉宽窗口：两项都在对方占位前完成 finalize
+        let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                 capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("q"),
+                                 concurrency: 2, resumeOnStart: true)
+        queue.addUploads([fa, fb])
+        waitUntil("两项都完成") { queue.snapshot().filter { $0.phase == .completed }.count == 2 }
+        assertEqual(engine.uploadCalls.count, 2, "两份拷贝都实际上传（localPath 不同，不收敛跳过）")
+        let p0 = engine.uploadCalls[0].remotePath.lowercased()
+        let p1 = engine.uploadCalls[1].remotePath.lowercased()
+        assertTrue(p0 != p1, "异步 hop 后定名必须现算 inflight：两项不得并发 STOR 同一远端路径")
+        queue.suspendForShutdown()
     }
 }
