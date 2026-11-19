@@ -19,6 +19,8 @@
 	<key>NSPhotoLibraryAddUsageDescription</key><string>用于保存从电视取回的照片。</string>
 	<!-- 局域网（FTP 到电视） -->
 	<key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoads</key><true/></dict>
+	<!-- macOS 15+ 局域网隐私门禁：缺此键系统可能不弹授权直接拒绝；同宿主模拟不触发门禁，真机待验 -->
+	<key>NSLocalNetworkUsageDescription</key><string>用于连接局域网中的电视，发送和取回照片视频。</string>
 	<!-- 接收图片/视频文件（Finder/Dock 拖放） -->
 	<key>CFBundleDocumentTypes</key>
 	<array>
