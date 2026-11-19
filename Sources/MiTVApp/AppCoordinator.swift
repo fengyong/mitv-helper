@@ -354,6 +354,7 @@ final class AppCoordinator: NSObject {
     }
 
     private func handleQueueChanged() {
+        abandonOrphanedPendingDeletes()
         if mode == .home {
             let has = queue.snapshot().isEmpty == false
             let current = content.subviews.first
@@ -678,6 +679,7 @@ final class AppCoordinator: NSObject {
         deleteRemote(pending.files, tolerateMissing: tolerateMissing, after: { [weak self] in
             guard let self = self else { return }
             self.deletingBatches.remove(batchId)
+            self.abandonOrphanedPendingDeletes()
             if self.pendingDeleteBatches[batchId] != nil {
                 self.showToast("还有文件没有删掉 · 下次连接电视后会自动重试")
             }
@@ -697,6 +699,21 @@ final class AppCoordinator: NSObject {
             let members = snapshot.filter { $0.batchId == batchId }
             guard !members.isEmpty, members.allSatisfy({ $0.phase == .completed }) else { continue }
             runPendingDelete(batchId: batchId, tolerateMissing: true)
+        }
+    }
+
+    /// 清空已完成/单项移除把在册批次的成员清光 → 视为用户放弃删除：显式摘登记 + 告知。
+    /// 不许静默作废（toast 承诺过自动重试）；也不许对空成员执行删除——
+    /// 「取回全部成功」这条数据安全前提已无法验证
+    private func abandonOrphanedPendingDeletes() {
+        guard !pendingDeleteBatches.isEmpty else { return }
+        let snapshot = queue.snapshot()
+        for batchId in Array(pendingDeleteBatches.keys) {
+            guard !deletingBatches.contains(batchId),
+                  !snapshot.contains(where: { $0.batchId == batchId }),
+                  let pending = pendingDeleteBatches.removeValue(forKey: batchId) else { continue }
+            savePendingDeletes()
+            showToast("已放弃删除 \(pending.files.count) 项 · 文件仍留在电视上")
         }
     }
 
