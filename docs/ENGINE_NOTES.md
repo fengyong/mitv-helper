@@ -59,3 +59,5 @@
 - `scripts/ftp_e2e.sh`：34/34 全绿（两连跑确认稳定），全绿时自清理工作目录。
 - 手工冒烟：对 GBK 模式 pyftpdlib 完整跑过 ping/probe/list/upload(--progress)/download/resume/delete/move/mkdir 与错误路径（550 映射、退出码）。
 - 真机（192.168.31.171:2121 SwiFTP）未验证——需要电视在场，留给主控集成阶段。
+- 真机回归（2026-11-20，电视在场）：ping/probe、GBK 中文目录 `/电视剧` 列表+上传+下载字节级往返、引擎 GBK 删除、MKD 根+嵌套、APPE 真实追加（MITVBBBB）、探针零残留——全过。响应谱：DELE 成功 250 "File successfully deleted"；DELE 缺失 **450** "Error deleting file"；RNFR 缺失 450；LIST/STOR 缺目录 550 "Can't CWD to invalid directory"；SIZE 缺对象 550 nonexistent；SIZE 含 `/` 路径 550 traversal。
+- **G1/G2 待修**（真机发现，见 ARCHITECTURE §2）：SIZE 发绝对路径真机恒 550 → sizeCommand/appeResume 误探 false、续传降级整传；DELE/RNFR 失败 450 映射 connectionFailed → tolerateMissing 真机失效。修复前真机续传与补删容忍不可用。

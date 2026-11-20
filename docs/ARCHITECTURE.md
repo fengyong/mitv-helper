@@ -42,13 +42,13 @@
 |---|---|---|
 | REST | **502** | 偏移续传不可用；续传 = SIZE 校验 + APPE 追加 |
 | APPE | ✅ 已验证 | STOR 前半 + APPE 后半 = 完整文件 |
-| MKD | **550** | 不能建目录 → 目标只能用已有目录：视频 `Movies/`、图片 `Pictures/`、否则根 |
+| MKD | mimo 实测夜 **550**；**2026-11-20 复测允许**（根/嵌套、绝对/相对均 257；能力随 U 盘/固件状态变化） | 默认仍用已有目录（智能分流）；能否新建以每次连接探测 `caps.mkdir` 为准（D1 门控） |
 | STOR 现有子目录 | ✅ | 智能分流可行 |
 | 文件名编码 | **GBK 全通**（中文/`[]`/空格/全角标点）；UTF-8 写入成功但电视端乱码 | 控制通道与文件名默认 GBK（GB18030 超集），探测通过 UTF-8 才切换 |
 | EPSV | ❌ 仅 PASV | 数据连接只用 PASV |
-| SIZE | ✅ | 可校验 |
+| SIZE | ✅ 但**拒绝含 `/` 的路径**（550 No directory traversal allowed in SIZE param）；CWD 相对裸名才 213 | 引擎须 CWD 父目录后 SIZE 裸名；现实现发绝对路径 → 真机恒失败（G1 待修） |
 | 大文件 | 5.4GB 无碍 | 无 4GB 限制 |
-| DELE / RNFR / RNTO / MLSD | **未实测**（真机响应文本谱待回归） | 引擎已实现；首连探测决定删除策略：DELE 可用→直删+强确认，不可用→禁用（2026-11-19 产品决策：软删除废弃，见 §7） |
+| DELE / RNFR / RNTO / MLSD | **2026-11-20 实测**：DELE/RNFR 失败 = **450** 泛化文本（Error deleting file / Cannot rename nonexistent file），成功 250；MLSD 502 | 删除策略按探测 deleteFile；**450 现映射 connectionFailed → 真机 remoteNotFound 不触发、tolerateMissing 失效（G2 待修）** |
 
 ## 3. 模块地图与所有权（并行不相交）
 

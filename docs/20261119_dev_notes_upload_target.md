@@ -50,11 +50,12 @@ DEV-NOTES-STATUS: DONE
 
 ## 遗留真机 / 人工验证项
 
-**真机（需电视在场，`192.168.31.171:2121` SwiFTP）**
-- MKD 550 降级链路实测（单测 + mock 已覆盖，真机未回归）
-- 真机 GBK 中文目录（如 `/电视剧/庆余年2`）指定与上传往返
-- 真机 caps.mkdir=false → 选择器「新建文件夹」隐藏确认
-- 上传到这里 → 批级落点真机落盘位置核对
+**真机（需电视在场，`192.168.31.171:2121` SwiFTP）** —— 2026-11-20 回归结果见 `docs/ENGINE_NOTES.md` §6 与 `docs/ARCHITECTURE.md` §2
+- ~~MKD 550 降级链路实测~~ 复测当前 U 盘 **MKD 允许**（根+嵌套均 257）→ 550 分支真机不可触发，由单测/mock 覆盖；降级链路 MKD 兜底真机可成功
+- ~~真机 GBK 中文目录指定与上传往返~~ ✅ 实测过（`/电视剧` 列表解码+上传+下载 cmp 一致+引擎 GBK 删除）
+- ~~真机 caps.mkdir=false 隐藏确认~~ 当前电视 mkdir=true → 按钮应**显示**（能力驱动正确）；false 态由 mock 走查覆盖
+- ~~上传到这里批级落点真机核对~~ 协议层 ✅（mitvctl upload --to /电视剧 落盘核对）；App 批级 UI 落点仍待人工
+- **新增待修 G1/G2**（引擎存量问题，真机暴露）：SIZE 绝对路径恒 550 → 续传/尺寸探测真机失效；DELE/RNFR 失败 450 映射 connectionFailed → tolerateMissing 真机失效
 
 **人工（headless 快照覆盖不到的交互/观感）**
 - chip 悬停 tooltip 完整层级（D4）；chip 点击打开选择器
