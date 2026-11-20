@@ -102,15 +102,31 @@ final class TVFileService {
             let entry = files[i]
             progress(i, total, entry.name)
             engine.delete(endpoint, remotePath: entry.path) { error in
-                if error == nil {
-                    deleted += 1
-                } else if tolerateMissing, let e = error as? EngineError, case .remoteNotFound = e {
-                    deleted += 1
-                } else {
-                    failedNames.append(entry.name)
+                func finish(ok: Bool) {
+                    if ok { deleted += 1 } else { failedNames.append(entry.name) }
+                    progress(i + 1, total, entry.name)
+                    step(i + 1)
                 }
-                progress(i + 1, total, entry.name)
-                step(i + 1)
+                if error == nil { finish(ok: true); return }
+                if tolerateMissing, let e = error as? EngineError, case .remoteNotFound = e {
+                    finish(ok: true)
+                    return
+                }
+                if tolerateMissing {
+                    // SwiFTP 真机删除失败回 450 泛化文本，证明不了缺席：
+                    // LIST 父目录确认名字不在才计删成功，否则保留失败（fail-safe）
+                    let parent = (entry.path as NSString).deletingLastPathComponent
+                    engine.list(endpoint, path: parent.isEmpty ? "/" : parent) { result in
+                        if case .success(let list) = result,
+                           !list.contains(where: { $0.name.lowercased() == entry.name.lowercased() }) {
+                            finish(ok: true)
+                        } else {
+                            finish(ok: false)
+                        }
+                    }
+                    return
+                }
+                finish(ok: false)
             }
         }
         step(0)

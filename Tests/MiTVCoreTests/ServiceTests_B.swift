@@ -1021,17 +1021,73 @@ extension ServiceTests_B {
             assertEqual(box2.outcome?.failedNames, ["a.mp4"], "默认模式 notFound 如实报失败")
         }
 
-        // 7) fail-safe：ioError（未识别 550，文件可能还在）即使 tolerateMissing 也不计删成功
+        // 7) fail-safe：ioError（450/未识别 550 泛化失败）+ LIST 证明文件还在 → 不计删成功
+        do {
+            let engine = InlineEngine()
+            engine.ioErrorDeletePaths = ["/Movies/a.mp4"]
+            engine.dirEntriesByPath["/Movies"] = [a, b]
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a, b], tolerateMissing: true, progress: { _, _, _ in }) { box.set($0) }
+            waitMain("ioError 补删返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 1, "ioError 且 LIST 在场 → 不计删成功（fail-open 会谎报已删除）")
+            assertEqual(box.outcome?.failedNames, ["a.mp4"], "ioError 留失败名单 → 登记保留待重试")
+        }
+
+        // 8) G2：ioError（SwiFTP 真机 450）+ LIST 确认缺席 → 计删成功（补删容忍真机生效）
+        do {
+            let engine = InlineEngine()
+            engine.ioErrorDeletePaths = ["/Movies/a.mp4"]
+            engine.dirEntriesByPath["/Movies"] = [b]
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a, b], tolerateMissing: true, progress: { _, _, _ in }) { box.set($0) }
+            waitMain("450 缺席补删返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 2, "450 泛化失败 + LIST 缺席 → 容忍计删成功")
+            assertEqual(box.outcome?.failedNames.count, 0, "缺席确认无失败名单")
+        }
+
+        // 9) fail-safe：ioError + LIST 本身失败 → 证明不了缺席 → 不计删成功
+        do {
+            let engine = InlineEngine()
+            engine.ioErrorDeletePaths = ["/Movies/a.mp4"]
+            engine.failListPath = "/Movies"
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a, b], tolerateMissing: true, progress: { _, _, _ in }) { box.set($0) }
+            waitMain("LIST 失败补删返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 1, "LIST 失败证明不了缺席 → 保留失败")
+            assertEqual(box.outcome?.failedNames, ["a.mp4"], "LIST 失败留失败名单")
+        }
+
+        // 10) 默认模式不做 LIST 确认（ioError 直接报失败，不额外发 LIST）
         do {
             let engine = InlineEngine()
             engine.ioErrorDeletePaths = ["/Movies/a.mp4"]
             let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
                                         capabilitiesProvider: { caps })
             let box = DeleteBox()
+            service.deleteEntries([a, b], progress: { _, _, _ in }) { box.set($0) }
+            waitMain("默认 ioError 返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 1, "默认模式 ioError 报失败")
+            assertEqual(engine.listCalls, 0, "默认模式不发确认 LIST")
+        }
+
+        // 11) 缺席判定大小写不敏感（U 盘 FAT/exFAT）：LIST 里 A.MP4 视为 a.mp4 还在
+        do {
+            let engine = InlineEngine()
+            engine.ioErrorDeletePaths = ["/Movies/a.mp4"]
+            engine.dirEntriesByPath["/Movies"] = [FTPFileEntry(path: "/Movies/A.MP4", name: "A.MP4", isDirectory: false, size: 5)]
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
             service.deleteEntries([a, b], tolerateMissing: true, progress: { _, _, _ in }) { box.set($0) }
-            waitMain("ioError 补删返回") { box.done }
-            assertEqual(box.outcome?.deletedCount, 1, "ioError 不计删成功（fail-open 会谎报已删除）")
-            assertEqual(box.outcome?.failedNames, ["a.mp4"], "ioError 留失败名单 → 登记保留待重试")
+            waitMain("大小写在场补删返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 1, "大小写不敏感：A.MP4 在场 → a.mp4 不算缺席")
+            assertEqual(box.outcome?.failedNames, ["a.mp4"], "大小写在场留失败名单")
         }
     }
 }

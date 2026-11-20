@@ -219,6 +219,18 @@ enum EngineTests_A {
         let e4d = FTPErrorMapper.map(code: 550, text: "File unavailable.", op: .retr, cmd: "RETR")
         assertTrue(matches(e4d) { if case .remoteNotFound = $0 { return true }; return false },
                    "550 读路径默认仍 remoteNotFound（不受 DELE 分支影响）")
+        let e4e = FTPErrorMapper.map(code: 450, text: "Error deleting file", op: .dele, cmd: "DELE")
+        assertTrue(matches(e4e) { if case .ioError = $0 { return true }; return false },
+                   "450 DELE（SwiFTP 真机缺失/泛化失败）→ ioError，不得落 connectionFailed 致补删容忍失效")
+        let e4f = FTPErrorMapper.map(code: 450, text: "Cannot rename nonexistent file", op: .rnfr, cmd: "RNFR")
+        assertTrue(matches(e4f) { if case .ioError = $0 { return true }; return false },
+                   "450 RNFR → ioError（与 DELE 同谱）")
+        let e4g = FTPErrorMapper.map(code: 450, text: "Some temporary failure", op: .stor, cmd: "STOR")
+        assertTrue(matches(e4g) { if case .connectionFailed = $0 { return true }; return false },
+                   "450 非删除/改名操作仍 connectionFailed（4xx 谱不变）")
+        let e4h = FTPErrorMapper.map(code: 421, text: "bye", op: .dele, cmd: "DELE")
+        assertTrue(matches(e4h) { if case .connectionFailed = $0 { return true }; return false },
+                   "421 DELE 仍 connectionFailed（断线谱不受 450 分支影响）")
         let e5 = FTPErrorMapper.map(code: 530, text: "Login incorrect.", op: .auth, cmd: "USER")
         assertTrue(matches(e5) { if case .authFailed = $0 { return true }; return false },
                    "530 → authFailed")

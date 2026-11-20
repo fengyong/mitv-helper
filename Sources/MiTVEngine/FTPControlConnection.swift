@@ -109,6 +109,15 @@ enum FTPErrorMapper {
             }
         case 552:
             return .ioError("服务器存储超限：\(text)")
+        case 450:
+            switch op {
+            case .dele, .rnfr, .rnto:
+                // SwiFTP 真机删除/改名失败统一 450 泛化文本，区分不了缺失与写保护：
+                // 落 ioError（文件可能还在）；补删的缺席确认由服务层 LIST 负责
+                return .ioError(text)
+            default:
+                return .connectionFailed("服务器临时错误 \(code)：\(text)")
+            }
         case 100...499:
             return .connectionFailed("服务器临时错误 \(code)：\(text)")
         default:
