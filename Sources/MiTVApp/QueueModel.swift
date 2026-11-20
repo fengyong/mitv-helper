@@ -61,6 +61,8 @@ struct QueueItem: Codable, Equatable {
     var remotePath: String?
     /// 上传分流结果目录（卡片显示「将存到 …」）
     var remoteDir: String?
+    /// 批级目标目录（「上传到这里」入队时写入；nil = 跟随全局存放位置/智能分流，设计稿 v2 §6.1）
+    var dirOverride: String?
     var phase: QueuePhase
     var failureReason: String?
     /// 已传字节
@@ -92,6 +94,7 @@ struct QueueItem: Codable, Equatable {
         self.sizeBytes = sizeBytes
         self.remotePath = nil
         self.remoteDir = nil
+        self.dirOverride = nil
         self.phase = .queued
         self.failureReason = nil
         self.bytes = 0

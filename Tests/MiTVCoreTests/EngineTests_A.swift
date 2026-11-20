@@ -26,6 +26,17 @@ enum EngineTests_A {
         let p5 = FTPPASVParser.parse("500 PASV not understood")
         assertTrue(p5 == nil, "非 227 文本返回 nil")
 
+        // MARK: SIZE 路径拆分（SwiFTP 拒绝含 / 的 SIZE 参数，550 traversal）
+        let sz1 = FTPPath.sizeSplit("/mitv.bin")
+        assertEqual(sz1.dir, "/", "SIZE 拆分：根级文件父目录 = /（免 CWD）")
+        assertEqual(sz1.name, "mitv.bin", "SIZE 拆分：根级裸名")
+        let sz2 = FTPPath.sizeSplit("/Movies/a.mp4")
+        assertEqual(sz2.dir, "/Movies", "SIZE 拆分：嵌套父目录")
+        assertEqual(sz2.name, "a.mp4", "SIZE 拆分：嵌套裸名")
+        let sz3 = FTPPath.sizeSplit("/电视剧/庆余年2/e01.mp4")
+        assertEqual(sz3.dir, "/电视剧/庆余年2", "SIZE 拆分：GBK 多级父目录")
+        assertEqual(sz3.name, "e01.mp4", "SIZE 拆分：GBK 裸名")
+
         // MARK: LIST 解析（unix ls -l 风格）
 
         let unix = FTPListParser.parse([
@@ -199,6 +210,27 @@ enum EngineTests_A {
         let e4 = FTPErrorMapper.map(code: 550, text: "Could not create file.", op: .stor, cmd: "STOR")
         assertTrue(matches(e4) { if case .permissionDenied = $0 { return true }; return false },
                    "550 STOR 默认 → permissionDenied")
+        let e4b = FTPErrorMapper.map(code: 550, text: "Could not delete file", op: .dele, cmd: "DELE")
+        assertTrue(matches(e4b) { if case .ioError = $0 { return true }; return false },
+                   "550 DELE 无关键词 → ioError（文件可能还在，不得落 remoteNotFound 致补删误报成功）")
+        let e4c = FTPErrorMapper.map(code: 550, text: "No such file or directory.", op: .dele, cmd: "DELE")
+        assertTrue(matches(e4c) { if case .remoteNotFound = $0 { return true }; return false },
+                   "550 DELE 关键词命中 → remoteNotFound（补删幂等依赖）")
+        let e4d = FTPErrorMapper.map(code: 550, text: "File unavailable.", op: .retr, cmd: "RETR")
+        assertTrue(matches(e4d) { if case .remoteNotFound = $0 { return true }; return false },
+                   "550 读路径默认仍 remoteNotFound（不受 DELE 分支影响）")
+        let e4e = FTPErrorMapper.map(code: 450, text: "Error deleting file", op: .dele, cmd: "DELE")
+        assertTrue(matches(e4e) { if case .ioError = $0 { return true }; return false },
+                   "450 DELE（SwiFTP 真机缺失/泛化失败）→ ioError，不得落 connectionFailed 致补删容忍失效")
+        let e4f = FTPErrorMapper.map(code: 450, text: "Cannot rename nonexistent file", op: .rnfr, cmd: "RNFR")
+        assertTrue(matches(e4f) { if case .ioError = $0 { return true }; return false },
+                   "450 RNFR → ioError（与 DELE 同谱）")
+        let e4g = FTPErrorMapper.map(code: 450, text: "Some temporary failure", op: .stor, cmd: "STOR")
+        assertTrue(matches(e4g) { if case .connectionFailed = $0 { return true }; return false },
+                   "450 非删除/改名操作仍 connectionFailed（4xx 谱不变）")
+        let e4h = FTPErrorMapper.map(code: 421, text: "bye", op: .dele, cmd: "DELE")
+        assertTrue(matches(e4h) { if case .connectionFailed = $0 { return true }; return false },
+                   "421 DELE 仍 connectionFailed（断线谱不受 450 分支影响）")
         let e5 = FTPErrorMapper.map(code: 530, text: "Login incorrect.", op: .auth, cmd: "USER")
         assertTrue(matches(e5) { if case .authFailed = $0 { return true }; return false },
                    "530 → authFailed")

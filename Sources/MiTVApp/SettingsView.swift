@@ -14,6 +14,9 @@ final class SettingsController: NSObject, NSWindowDelegate {
     private let soundToggle = NSButton(checkboxWithTitle: "完成时播放提示音", target: nil, action: nil)
     private let concurrencyPopup = NSPopUpButton()
     private let tvInfoLabel = UIUtil.label("", size: 12, color: .secondaryLabelColor)
+    /// 存放位置区块（设计稿 v2 §5.5/D7：与 chip 同源的全局状态）
+    private let pathCurrent = UIUtil.label("", size: 12)
+    private let resetLocationButton = CapsuleButton("恢复智能分类", style: .secondary)
 
     init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
@@ -64,9 +67,25 @@ final class SettingsController: NSObject, NSWindowDelegate {
         concurrencyPopup.action = #selector(concurrencyChanged)
 
         let pathTitle = UIUtil.label("存放位置", size: 13, weight: .semibold, color: .secondaryLabelColor)
-        let pathText = UIUtil.label("视频放进电视的 Movies 文件夹，照片放进 Pictures 文件夹，\n其他放在电视 U 盘根目录。重名文件自动顺延编号。",
+        pathCurrent.lineBreakMode = .byWordWrapping
+        let changeLocationButton = CapsuleButton("更改…", style: .secondary)
+        changeLocationButton.tapAction = { [weak self] in
+            guard let self = self else { return }
+            // 一个窗口同时只挂一张 sheet：先收设置页，再开选择器（同一入口 openLocationPicker，D7）
+            self.closeSheet()
+            self.coordinator.openLocationPicker()
+        }
+        resetLocationButton.tapAction = { [weak self] in
+            guard let self = self else { return }
+            self.coordinator.applyUploadTarget(nil)
+            self.refreshLocationBlock()
+        }
+        let locationRow = NSStackView(views: [changeLocationButton, resetLocationButton])
+        locationRow.orientation = .horizontal
+        locationRow.spacing = 10
+        let pathHint = UIUtil.label("重名文件自动顺延编号；同名但内容不同的文件自动加指纹后缀。",
                                     size: 12, color: .secondaryLabelColor)
-        pathText.lineBreakMode = .byWordWrapping
+        pathHint.lineBreakMode = .byWordWrapping
 
         let engineTitle = UIUtil.label("连接方式", size: 13, weight: .semibold, color: .secondaryLabelColor)
         demoToggle.target = self
@@ -87,7 +106,7 @@ final class SettingsController: NSObject, NSWindowDelegate {
             title,
             tvTitle, tvInfoLabel, reconnect,
             queueTitle, concLabel, concurrencyPopup,
-            pathTitle, pathText,
+            pathTitle, pathCurrent, locationRow, pathHint,
             engineTitle, demoToggle, notifyToggle, soundToggle,
             doneButton,
         ])
@@ -97,15 +116,17 @@ final class SettingsController: NSObject, NSWindowDelegate {
         stack.setCustomSpacing(16, after: title)
         stack.setCustomSpacing(16, after: reconnect)
         stack.setCustomSpacing(16, after: concurrencyPopup)
-        stack.setCustomSpacing(16, after: pathText)
+        stack.setCustomSpacing(16, after: pathHint)
         stack.setCustomSpacing(16, after: soundToggle)
         stack.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = stack
-        pathText.preferredMaxLayoutWidth = 418 // 滚动视图内换行标签需要显式宽度
+        pathCurrent.preferredMaxLayoutWidth = 418 // 滚动视图内换行标签需要显式宽度
+        pathHint.preferredMaxLayoutWidth = 418
 
         let name = coordinator.store.state.tvName ?? "电视"
         let addr = coordinator.store.endpoint?.display ?? "未连接"
         tvInfoLabel.stringValue = "当前：\(name) · \(addr)"
+        refreshLocationBlock()
 
         NSLayoutConstraint.activate([
             scroll.topAnchor.constraint(equalTo: root.topAnchor, constant: 32),
@@ -134,6 +155,17 @@ final class SettingsController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         onClose?()
         window = nil
+    }
+
+    /// 存放位置区块随全局状态刷新（与 chip 同源，D7）：指定模式追加「恢复智能分类」按钮
+    private func refreshLocationBlock() {
+        if let dir = coordinator.store.state.customUploadDir {
+            pathCurrent.stringValue = "当前：\(coordinator.targetDisplayPath(dir))（所有文件放进该文件夹）"
+            resetLocationButton.isHidden = false
+        } else {
+            pathCurrent.stringValue = "当前：智能分类（视频进 Movies 文件夹，照片进 Pictures 文件夹，其他进根目录）"
+            resetLocationButton.isHidden = true
+        }
     }
 
     @objc private func concurrencyChanged() {

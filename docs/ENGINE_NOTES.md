@@ -38,6 +38,7 @@
 | 550/553 + "permission/denied/not allowed/forbidden" | permissionDenied |
 | 550/553 + "not found/no such/…"/读路径默认 | remoteNotFound |
 | 550/553 + 写操作默认（STOR/APPE/MKD/RNTO/RMD） | permissionDenied（如 SwiFTP MKD 550） |
+| 550/553 + DELE 无关键词 | ioError（文件可能还在；落 remoteNotFound 会被补删 tolerateMissing 误计删成功） |
 | 530/531 | authFailed |
 | 500/501/502/504 | unsupported(cmd) |
 | 421/425/426/其余 4xx | connectionFailed |
@@ -47,7 +48,7 @@
 ## 5. 已知边界 / 遗留
 
 - 探测 `utf8Filenames` 与 GBK 恒定发送的矛盾：真机 SwiFTP 上 UTF-8 试写读回**会**通过（服务器按字节透传），但电视端播放器按 GBK 显示会乱码——按契约「探测通过才切换」实现，**引擎默认恒 GBK**，故实际不受影响；该探测位由服务层自行解读。
-- 550 的 remoteNotFound vs permissionDenied 靠响应文本关键词判别，遇到非英文响应可能落入默认分支。
+- 550 的 remoteNotFound vs permissionDenied 靠响应文本关键词判别，遇到非英文响应可能落入默认分支。DELE 的默认分支为 ioError（fail-safe：补删宁可保留登记重试，不误报已删）；读路径默认仍 remoteNotFound。
 - 断点续传只覆盖单文件内偏移（SIZE+APPE）；队列级状态恢复归 UI/服务层（V1 优先级低）。
 - Makefile test 目标追加了 `$(ENGINE)`（见 commit 068bdc7 的 [CONTRACT-REQUEST]）：EngineTests_A 需要引擎纯逻辑源码参与单模块编译。
 
@@ -58,3 +59,5 @@
 - `scripts/ftp_e2e.sh`：34/34 全绿（两连跑确认稳定），全绿时自清理工作目录。
 - 手工冒烟：对 GBK 模式 pyftpdlib 完整跑过 ping/probe/list/upload(--progress)/download/resume/delete/move/mkdir 与错误路径（550 映射、退出码）。
 - 真机（192.168.31.171:2121 SwiFTP）未验证——需要电视在场，留给主控集成阶段。
+- 真机回归（2026-11-20，电视在场）：ping/probe、GBK 中文目录 `/电视剧` 列表+上传+下载字节级往返、引擎 GBK 删除、MKD 根+嵌套、APPE 真实追加（MITVBBBB）、探针零残留——全过。响应谱：DELE 成功 250 "File successfully deleted"；DELE 缺失 **450** "Error deleting file"；RNFR 缺失 450；LIST/STOR 缺目录 550 "Can't CWD to invalid directory"；SIZE 缺对象 550 nonexistent；SIZE 含 `/` 路径 550 traversal。
+- **G1/G2 已修**（2026-11-20，87e1679 / 8e1516b）：SIZE 改 CWD 父目录+裸名（真机复探 size/appe 转 true，续传 STOR+SIZE+APPE 实测字节一致）；450+dele/rnfr/rnto 映射 ioError，补删缺席改服务层 LIST 确认（大小写不敏感、LIST 失败保留失败）。双向变异各红 6/2/6 项后恢复 414 全绿。

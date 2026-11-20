@@ -42,13 +42,13 @@
 |---|---|---|
 | REST | **502** | 偏移续传不可用；续传 = SIZE 校验 + APPE 追加 |
 | APPE | ✅ 已验证 | STOR 前半 + APPE 后半 = 完整文件 |
-| MKD | **550** | 不能建目录 → 目标只能用已有目录：视频 `Movies/`、图片 `Pictures/`、否则根 |
+| MKD | mimo 实测夜 **550**；**2026-11-20 复测允许**（根/嵌套、绝对/相对均 257；能力随 U 盘/固件状态变化） | 默认仍用已有目录（智能分流）；能否新建以每次连接探测 `caps.mkdir` 为准（D1 门控） |
 | STOR 现有子目录 | ✅ | 智能分流可行 |
 | 文件名编码 | **GBK 全通**（中文/`[]`/空格/全角标点）；UTF-8 写入成功但电视端乱码 | 控制通道与文件名默认 GBK（GB18030 超集），探测通过 UTF-8 才切换 |
 | EPSV | ❌ 仅 PASV | 数据连接只用 PASV |
-| SIZE | ✅ | 可校验 |
+| SIZE | ✅ 但**拒绝含 `/` 的路径**（550 No directory traversal allowed in SIZE param）；CWD 相对裸名才 213 | 引擎已改 CWD 父目录 + SIZE 裸名（G1 修，87e1679）；真机复探 size/appe 转 true、续传链路实测过 |
 | 大文件 | 5.4GB 无碍 | 无 4GB 限制 |
-| DELE / RNFR / RNTO / MLSD | **未实测** | 引擎必须实现；首连探测决定（软删除依赖 RNTO） |
+| DELE / RNFR / RNTO / MLSD | **2026-11-20 实测**：DELE/RNFR 失败 = **450** 泛化文本（Error deleting file / Cannot rename nonexistent file），成功 250；MLSD 502 | 450+dele/rnfr/rnto 映射 ioError；补删缺席由服务层 LIST 确认（G2 修，8e1516b） |
 
 ## 3. 模块地图与所有权（并行不相交）
 
@@ -116,33 +116,32 @@ mitvctl mkdir  --host H --path P
 - `UI/QueueView.swift` + `UI/QueueCardView.swift`：缩略图（照片 NSImage / 视频 AVAssetImageGenerator 首帧）+ 文件名 + 自绘细进度条（accent 色）+ 速度/剩余时间 + 悬停操作（暂停/取消/重试）；完成 10s 收进「已完成」折叠组
 - `UI/PhotoPickerView.swift`：Photos 框架自建网格（PHPhotoLibrary 授权 → PHAssetCollection cameraRoll → PHFetchOptions 按 creationDate 倒序 → NSCollectionView 网格，PHImageManager.requestImage 400px 缩略）；多选（⌘点击/框选/悬停勾选）；「添加 N 张」→ PHAssetResource 导出**原文件**到 StagingStore（iCloud 原件 `isNetworkAccessAllowed=true`），导出进度可见
 - `UI/FilePickerView.swift`：NSOpenPanel 封装（默认 ~/Downloads，记住上次目录；选文件夹时递归展开媒体文件）
-- `UI/TVBrowserView.swift`：电视 U 盘网格（图标+名字，按目录层级浏览返回）；多选（同交互）；底部毛玻璃操作条 `已选 N 项 · X MB [下载] [删除] ✕`；删除走 §7 软删除；toast 撤销
+- `UI/TVBrowserView.swift`：电视 U 盘网格（图标+名字，按目录层级浏览返回）；多选（同交互）；底部毛玻璃操作条 `已选 N 项 · X MB [下载] [删除] ✕`；删除走 §7 直删+强确认；可选「删除前先下载到本地」兜底
 - `UI/OnboardingView.swift`：三步首连向导（§产品文档 6.2）；`UI/SettingsView.swift`：一页设置
 - `Services/TVStore.swift`：endpoint + capabilities + 上次目录持久化（`~/Library/Application Support/MiTVHelper/`，JSON 原子写）
 - `Services/QueueService.swift`：任务状态机（queued/connecting/running/paused/failed/completed/canceled）、并发 2（OperationQueue maxConcurrentOperationCount）、持久化（JSON，每次变更原子写、启动恢复）、重试（失败项右键重试）
 - `Services/HeartbeatService.swift`：10s NOOP，两连失败 → 掉线（黄条 + 队列暂停）→ 指数退避重连 5s/15s/30s…120s 封顶，重连成功恢复队列
-- `Services/PickService.swift`、`Services/StagingStore.swift`、`Services/TVFileService.swift`（浏览/删除/软删除/下载编排）
+- `Services/PickService.swift`、`Services/StagingStore.swift`、`Services/TVFileService.swift`（浏览/删除/删除前先下载编排）
 - `Testing/MockEngine.swift` + `Testing/MockFactory.swift`：实现 TransferEngine 协议——可脚本化：list 返回预置目录树（含中文名文件）、upload 按 4MB/s 假进度走完全程、delete/move 落内存记账、probe 返回「GBK + APPE + 无 MKD + rename 可用」矩阵。**App 默认用 Mock（UserDefaults 键 `useMockEngine`，默认 true）**，主控集成时切真实引擎。
 - 智能分流（上传前定目标路径）：查远端列表（engine.list "/"）→ 视频→`/Movies/<GB名>`、图片→`/Pictures/<GB名>`、都没有→`/<GB名>`；卡片显示「将存到 …」。命名策略（2026-11-19 定案）：原名尽可能保留，特殊字符替换 "-"；远端同名 → 比尺寸 + 前 10MB 指纹，相同文件跳过上传，不同文件改名 `原名-<md5前8>.ext`（判定不了保守改名，不覆盖）
 
 **AppKit 手法约束**（无 SwiftUI）：NSVisualEffectView 毛玻璃；自绘进度条（NSView draw + NSSetDisplaysWhenDrawing）；动画 NSAnimationContext；深浅色自适应跟系统；留白大方；**绝不出现 FTP/端口/主机等术语**。
-**DoD**：`make app` 编译通过 + `make test`（含 B 套件）全绿 + 启动后三态可切（Mock 下可见完整流程）+ 队列持久化重开恢复 + ServiceTests_B 覆盖（状态机/分流/软删除决策/持久化 round-trip）+ 至少 5 个小步 commit。
+**DoD**：`make app` 编译通过 + `make test`（含 B 套件）全绿 + 启动后三态可切（Mock 下可见完整流程）+ 队列持久化重开恢复 + ServiceTests_B 覆盖（状态机/分流/删除决策 hard-disabled/持久化 round-trip）+ 至少 5 个小步 commit。
 
-## 7. 软删除决策表（B 的 TVFileService 按 Capabilities 分支）
+## 7. 删除决策表（B 的 TVFileService 按 Capabilities 分支；2026-11-19 产品决策：直删，软删除/回收站/撤销废弃）
 
-| Capabilities.rename | Capabilities.deleteFile | 行为 |
-|---|---|---|
-| true | * | 软删除：move → `/.MITV-Trash/<原父目录扁平化名>/<原名>`；本地记录原路径（供撤销）；toast 撤销=rename 回去 |
-| false | true | 直删 + 强确认文案「永久删除，无法撤销」+「删除前先下载到本地」勾选兜底 |
-| false | false | 删除按钮禁用 + 提示「这台电视不支持删除」 |
+| Capabilities.deleteFile | 行为 |
+|---|---|
+| true | 直删 DELE + 强确认文案「永久删除，无法撤销」+ 可选「删除前先下载到本地」兜底（取回登记持久化，取回全成功后自动续删；未全成功暂停删除并提示） |
+| false | 删除按钮禁用 + 提示「这台电视不支持删除」 |
 
-`.MITV-Trash` 目录名纯 ASCII；若 mkdir=false 且目录不存在 → 先 move 单文件到 `/`+`.MITV-Trash` 前缀改名兜底（如 `.MITV-Trash--Movies--a.mp4`），并本地记录原路径。
+`SoftDeletePolicy.trashRoot` / `prefixTag` 仅保留为**旧版本残留的浏览过滤**（旧版软删除残留仍可能在电视上，浏览页隐藏）；不再新写回收站、无撤销。DELE 无关键词响应映射 ioError（fail-safe：文件可能还在，不误计已删）。
 
 ## 8. 优先级（用户明示）
 
 **高**：连接/向导、拖拽入队、照片选择、上传+进度、GBK 原名、智能分流、多选删除、浏览。
 **低（本轮不做深度）**：断点续传的完整 UI/状态恢复（引擎侧 APPE 支持保留即可，UI 只需不破坏）。
-**不做**：格式转码、自动发现、回收站自动清理。
+**不做**：格式转码、自动发现、旧版回收站残留自动清理（现仅浏览过滤）。
 
 ## 9. 集成计划（主控负责，agents 完成后）
 

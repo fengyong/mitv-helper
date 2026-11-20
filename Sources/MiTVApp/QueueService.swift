@@ -25,6 +25,11 @@ final class QueueService {
     var onChanged: (() -> Void)?
     /// 一个批量内全部任务终结（completed 数 / 失败+取消数）
     var onBatchCompleted: ((_ batchId: String, _ completed: Int, _ failed: Int) -> Void)?
+    /// 指定目录上传时已失效、降级回根目录后回调（主队列，每批至多一次；供 toast 告知，设计稿 v2 §6.3/D6）
+    var onUploadFallback: ((_ batchId: String, _ dir: String) -> Void)?
+
+    /// 全局指定目录（「存放位置 = 指定位置」）：nil = 智能分类（AppCoordinator 注入 TVStore 快照，设计稿 v2 §6.1）
+    var targetDirProvider: (() -> String?)?
 
     // MARK: 状态（全部仅 stateQ 内访问）
 
@@ -34,6 +39,8 @@ final class QueueService {
     private var batchNotified: Set<String> = []
     private var schedulerHalted = false
     private var hold: HoldReason = .none
+    /// 已发过降级告知的批次（每批至多一次，防整批降级时 toast 刷屏）
+    private var fallbackNotifiedBatches: Set<String> = []
     private var lastPersistAt = Date.distantPast
     private var notifyPending = false
     private var notifyDirty = false
@@ -100,7 +107,7 @@ final class QueueService {
     // MARK: 入队
 
     @discardableResult
-    func addUploads(_ urls: [URL]) -> [QueueItem] {
+    func addUploads(_ urls: [URL], targetDir: String? = nil) -> [QueueItem] {
         let fm = FileManager.default
         let batch = UUID().uuidString
         let created: [QueueItem] = urls.compactMap { url in
@@ -108,9 +115,12 @@ final class QueueService {
             var size: Int64 = 0
             if let attr = try? fm.attributesOfItem(atPath: url.path),
                let n = attr[.size] as? NSNumber { size = n.int64Value }
-            return QueueItem(direction: .upload, kind: MediaKind.of(url: url),
-                             localPath: url.path, displayName: name,
-                             sizeBytes: size, batchId: batch)
+            var it = QueueItem(direction: .upload, kind: MediaKind.of(url: url),
+                               localPath: url.path, displayName: name,
+                               sizeBytes: size, batchId: batch)
+            // 批级目标（「上传到这里」）：入队即写入任务项，随 queue.json 持久化（设计稿 v2 §6.1）
+            if let dir = targetDir { it.dirOverride = dir }
+            return it
         }
         guard !created.isEmpty else { return [] }
         stateQ.sync {
@@ -283,6 +293,11 @@ final class QueueService {
             let before = items[idx].phase
             items[idx] = QueueStateMachine.apply(event, to: items[idx])
             if items[idx].phase != before {
+                if before.isTerminal && !items[idx].phase.isTerminal {
+                    // 重试把批次拉回非终态后必须重新武装完成回调，
+                    // 否则「删除前先下载」的批次重试成功后不会再触发删除
+                    batchNotified.remove(items[idx].batchId)
+                }
                 if cancelHandle { handles[id]?.cancel() }
                 persistLocked(force: true)
                 notifyChange()
@@ -328,7 +343,14 @@ final class QueueService {
                 startUpload(id, handle: handle)
                 return
             }
-            // 智能分流：先看根目录定目标文件夹
+            // 两层目标解析（设计稿 v2 §6.1）：任务项批级目标（「上传到这里」）> 全局指定位置 > 智能分流。
+            // 指定目录（非根）直列目标目录本身：存在与否以 LIST 结果为准，比智能分流少一次根目录 LIST
+            let explicit = item.dirOverride ?? targetDirProvider?()
+            if let dir = explicit, dir != "/" {
+                listUploadTarget(id, dir: dir, handle: handle)
+                return
+            }
+            // 智能分流（或显式根目录）：先看根目录定目标文件夹（根列表兼作重名判定依据）
             engineProvider().list(endpoint, path: "/") { [weak self] result in
                 guard let self = self else { return }
                 self.stateQ.async { self.chooseUploadDir(id, rootEntries: result, handle: handle) }
@@ -347,7 +369,9 @@ final class QueueService {
             startUploadWithFallback(id, dir: "/", handle: handle)
             return
         }
-        let dir = SmartRouting.destinationDir(kind: items[idx].kind)
+        // 两层解析（设计稿 v2 §6.1）：批级覆盖 / 全局指定 / 智能分流。非根指定目录已在 beginTransfer
+        // 直列目标目录，走到这里只可能是「显式根目录」或「智能分流」
+        let dir = items[idx].dirOverride ?? targetDirProvider?() ?? SmartRouting.destinationDir(kind: items[idx].kind)
         if dir == "/" {
             finalizeUploadRouting(id, dir: dir, dirExisted: true, dirEntries: rootEntries, handle: handle)
             return
@@ -384,6 +408,63 @@ final class QueueService {
         }
     }
 
+    /// 指定目标目录上传（设计稿 v2 §6.3）：直列该目录；目录不存在 → 尽力 MKD 重建最后一级 →
+    /// 仍失败回退电视根目录（D6）+ onUploadFallback（主队列，每批至多一次防 toast 刷屏）
+    private func listUploadTarget(_ id: String, dir: String, handle: TransferHandle) {
+        guard let endpoint = endpointProvider() else {
+            finishWithEngineError(id: id, error: EngineError.notConnected)
+            return
+        }
+        engineProvider().list(endpoint, path: dir) { [weak self] result in
+            guard let self = self else { return }
+            self.stateQ.async {
+                guard let idx = self.items.firstIndex(where: { $0.id == id }),
+                      self.items[idx].phase == .connecting else { return } // 可能已被暂停/取消
+                if case .success(let entries) = result {
+                    self.finalizeUploadRouting(id, dir: dir, dirExisted: true, dirEntries: .success(entries), handle: handle)
+                } else {
+                    self.recoverUploadTarget(id, dir: dir, handle: handle)
+                }
+            }
+        }
+    }
+
+    /// 指定目录 LIST 失败的兜底：尽力 MKD（支持建目录的设备自动重建）→ LIST；
+    /// 仍失败（真机 MKD 550 等）→ 回根目录 + 每批一次的降级告知
+    private func recoverUploadTarget(_ id: String, dir: String, handle: TransferHandle) {
+        guard let endpoint = endpointProvider() else {
+            finishWithEngineError(id: id, error: EngineError.notConnected)
+            return
+        }
+        engineProvider().makeDirectory(endpoint, path: dir) { [weak self] _ in
+            guard let self = self else { return }
+            self.stateQ.async {
+                guard let idx = self.items.firstIndex(where: { $0.id == id }),
+                      self.items[idx].phase == .connecting,
+                      let endpoint2 = self.endpointProvider() else {
+                    self.finishWithEngineError(id: id, error: EngineError.notConnected)
+                    return
+                }
+                self.engineProvider().list(endpoint2, path: dir) { result in
+                    self.stateQ.async {
+                        guard let idx2 = self.items.firstIndex(where: { $0.id == id }),
+                              self.items[idx2].phase == .connecting else { return }
+                        if case .success(let entries) = result {
+                            self.finalizeUploadRouting(id, dir: dir, dirExisted: false, dirEntries: .success(entries), handle: handle)
+                        } else {
+                            let batchId = self.items[idx2].batchId
+                            if !self.fallbackNotifiedBatches.contains(batchId) {
+                                self.fallbackNotifiedBatches.insert(batchId)
+                                DispatchQueue.main.async { [weak self] in self?.onUploadFallback?(batchId, dir) }
+                            }
+                            self.startUploadWithFallback(id, dir: "/", handle: handle)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 智能分流第二步：目标目录列表 → 净化命名 / 同名判定（相同文件跳过，不同文件加 MD5 后缀）→ 起传
     private func finalizeUploadRouting(_ id: String, dir: String, dirExisted: Bool,
                                        dirEntries: Result<[FTPFileEntry], Error>, handle: TransferHandle) {
@@ -400,24 +481,21 @@ final class QueueService {
             }
             return
         }
-        // 并发互斥：其他未终结上传项在【同一目标目录】已占用的远端名也计入
-        //（各项回调在 stateQ 串行处理，无竞态；跨目录同名不算冲突）
-        let inflight = inflightUploadNames(dir: dir, excluding: id)
         let mapped = NameCodec.remoteName(for: items[idx].displayName)
         // 磁盘上已有同名文件 → 「相同文件」判定（尺寸 → 前 10MB 指纹）
         if let clash = dirList.first(where: { !$0.isDirectory && $0.name.caseInsensitiveCompare(mapped.remote) == .orderedSame }) { // FAT 大小写不敏感
             decideSameFileOrSuffix(id, dir: dir, proposedName: mapped.remote, needsMapping: mapped.needsMapping,
-                                   clash: clash, dirList: dirList, inflight: inflight, handle: handle)
+                                   clash: clash, dirList: dirList, handle: handle)
             return
         }
         beginUpload(id, dir: dir, remoteName: mapped.remote, needsMapping: mapped.needsMapping,
-                    dirList: dirList, inflight: inflight, handle: handle)
+                    dirList: dirList, handle: handle)
     }
 
     /// 同名冲突判定：远端是相同文件 → 跳过上传；不同文件（或判定不了）→ 原名后加内容指纹改名；
     /// 指纹名若也被占用，对它再做一次相同判定（同一内容此前已传过 → 跳过，不堆积 (2)(3)）
     private func decideSameFileOrSuffix(_ id: String, dir: String, proposedName: String, needsMapping: Bool,
-                                        clash: FTPFileEntry, dirList: [FTPFileEntry], inflight: Set<String>,
+                                        clash: FTPFileEntry, dirList: [FTPFileEntry],
                                         handle: TransferHandle) {
         func stillConnecting(_ id: String) -> Bool {
             guard let idx = items.firstIndex(where: { $0.id == id }) else { return false }
@@ -450,13 +528,13 @@ final class QueueService {
                                     self.skipUploadAsDuplicate(id, dir: dir, remotePath: second.path, needsMapping: needsMapping)
                                 } else {
                                     self.beginUpload(id, dir: dir, remoteName: candidate, needsMapping: needsMapping,
-                                                     dirList: dirList, inflight: inflight, handle: handle)
+                                                     dirList: dirList, handle: handle)
                                 }
                             }
                         }
                     } else {
                         self.beginUpload(id, dir: dir, remoteName: candidate, needsMapping: needsMapping,
-                                         dirList: dirList, inflight: inflight, handle: handle)
+                                         dirList: dirList, handle: handle)
                     }
                 }
 
@@ -545,8 +623,8 @@ final class QueueService {
             return
         }
         // 降级路径同样要查 inflight：两项同名都降级时，SIZE 探测都返回 nil（盘上还没有），
-        // 不查重就会并发 STOR 同一目标互相毁掉
-        let unique = NameCodec.capped(NameCodec.uniqued(finalName, existing: inflightUploadNames(dir: dir, excluding: id),
+        // 不查重就会并发 STOR 同一目标互相毁掉；已完成兄弟项的占名同样要查（hop 期间完成者不可见）
+        let unique = NameCodec.capped(NameCodec.uniqued(finalName, existing: occupiedUploadNames(dir: dir, excluding: id),
                                        caseInsensitive: true)).name
         items[idx].remoteDir = dir
         items[idx].remotePath = dir == "/" ? "/" + unique : dir + "/" + unique
@@ -577,6 +655,17 @@ final class QueueService {
         })
     }
 
+    /// 定名时的已占用名 = inflight 占位 + 已完成兄弟项的实际占名。
+    /// 兄弟项在异步 hop（LIST/SIZE/指纹）期间完成时 inflight 看不见它、dirList 快照也旧：
+    /// 无 clash 路径用原名 → 会 STOR 覆盖兄弟项刚传好的不同内容文件
+    private func occupiedUploadNames(dir: String, excluding id: String) -> Set<String> {
+        inflightUploadNames(dir: dir, excluding: id).union(items.compactMap { other -> String? in
+            guard other.id != id, other.direction == .upload, other.phase == .completed,
+                  other.remoteDir == dir, let p = other.remotePath else { return nil }
+            return (p as NSString).lastPathComponent
+        })
+    }
+
     /// 同一本地文件被重复拖入：已有【已完成】的同文件同目录项 → 直接收敛为跳过，
     /// 不再传一份副本（未完成项不收敛——它可能失败，顺延改名更安全）
     private func completedDuplicatePath(localPath: String, dir: String, excluding id: String) -> String? {
@@ -589,14 +678,16 @@ final class QueueService {
 
     /// 定名（净化名/指纹名 + 重名顺延）→ 起传
     private func beginUpload(_ id: String, dir: String, remoteName: String, needsMapping: Bool,
-                             dirList: [FTPFileEntry], inflight: Set<String>, handle: TransferHandle) {
+                             dirList: [FTPFileEntry], handle: TransferHandle) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
         guard items[idx].phase == .connecting else { return } // 可能已被暂停/取消
         if let dup = completedDuplicatePath(localPath: items[idx].localPath, dir: dir, excluding: id) {
             skipUploadAsDuplicate(id, dir: dir, remotePath: dup, needsMapping: needsMapping)
             return
         }
-        let allNames = SmartRouting.existingNames(entries: dirList).union(inflight)
+        // inflight 必须在此刻现算：clash 判定经过指纹/远端前缀多次异步 hop，
+        // finalize 时的快照里看不见 hop 期间其他项的占位 → 会并发 STOR 同一远端名
+        let allNames = SmartRouting.existingNames(entries: dirList).union(occupiedUploadNames(dir: dir, excluding: id))
         // 顺延后缀可能把名字推过 NAME_MAX → 定名后再按 GBK 字节截断
         let unique = NameCodec.capped(NameCodec.uniqued(remoteName, existing: allNames, caseInsensitive: true)).name
         items[idx].remoteDir = dir

@@ -20,7 +20,14 @@ enum ServiceTests_B {
         testDirectDelete()
         testPauseAllCancelsHandles()
         testBatchNameCollisions()
+        testStaleInflightRace()
+        testBatchRetryRearm()
+        testCompletedSiblingBlindSpot()
         testThumbFetchSafety()
+        testUploadTargetPersistence()
+        testQueueItemDirOverrideRoundTrip()
+        testExplicitTargetDirRouting()
+        testCustomTargetDegradation()
     }
 
     // MARK: - 队列状态机
@@ -223,6 +230,10 @@ enum ServiceTests_B {
         private(set) var deleteCalls: [String] = []
         /// 指定路径的 delete 以失败收场（清空回收站部分失败测试用）
         var failDeletePaths: Set<String> = []
+        /// 指定路径的 delete 报 remoteNotFound（重启补删 tolerateMissing 测试用）
+        var notFoundDeletePaths: Set<String> = []
+        /// 指定路径的 delete 报 ioError（未识别 550：文件可能还在，补删不得容忍）
+        var ioErrorDeletePaths: Set<String> = []
         private(set) var uploadHandles: [TransferHandle?] = []
         private(set) var downloadHandles: [TransferHandle?] = []
         /// true 时 upload 完成回调被扣住，供测试精确控制时序；false 时延迟自动成功/失败
@@ -241,16 +252,27 @@ enum ServiceTests_B {
         var pendingDownloadCompletions: [(Result<Int64, Error>) -> Void] = []
         /// 指定路径的 list 以失败收场（目录存在但列不出内容的怪癖模拟）
         var failListPath: String?
+        /// 指定路径前 N 次 list 失败、之后成功（指定目录「首列失败 → MKD 重建 → 再列成功」测试用）
+        var listFailCounts: [String: Int] = [:]
         /// MKD 是否成功（真机 SwiFTP 550 → false）
         var allowMKD = false
         /// size() 按路径返回预设值（降级同名探测测试用）；未命中 → success(nil)
         var remoteSizes: [String: Int64] = [:]
         /// downloadPrefix 返回的「远端前缀」内容（nil → 失败）
         var remotePrefix: Data?
+        /// downloadPrefix 回调延迟（拉宽异步窗口，复现过期 inflight 快照竞态用）
+        var prefixDelay: TimeInterval = 0.02
+        /// LIST/SIZE 回调延迟序列（按调用次序消费，末值重复；nil=无延迟）：
+        /// 让兄弟项在另一项的 LIST/SIZE hop 期间完成，确定性复现定名盲区
+        var listDelays: [TimeInterval]?
+        var sizeDelays: [TimeInterval]?
+        private var listCallCount = 0
+        private var sizeCallCount = 0
         private var prefixCallCount = 0
         private let lock = NSLock()
 
         var prefixCalls: Int { lock.lock(); defer { lock.unlock() }; return prefixCallCount }
+        var listCalls: Int { lock.lock(); defer { lock.unlock() }; return listCallCount }
 
         func releaseAllUploads(_ result: Result<Int64, Error>) {
             lock.lock(); let cbs = pendingUploadCompletions; pendingUploadCompletions = []; lock.unlock()
@@ -273,9 +295,26 @@ enum ServiceTests_B {
 
         func ping(_ endpoint: FTPEndpoint, completion: @escaping (Error?) -> Void) { DispatchQueue.global().async { completion(nil) } }
         func list(_ endpoint: FTPEndpoint, path: String, completion: @escaping (Result<[FTPFileEntry], Error>) -> Void) {
-            DispatchQueue.global().async {
+            lock.lock()
+            let i = listCallCount; listCallCount += 1
+            let seq = listDelays
+            lock.unlock()
+            let delay = seq.map { $0[min(i, $0.count - 1)] } ?? 0
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
                 if self.failAllLists {
                     completion(.failure(EngineError.connectionFailed("模拟列表失败")))
+                    return
+                }
+                // 按路径的「前 N 次失败」脚本：MKD 重建后同一路径再列即成功
+                var remainingFail = 0
+                self.lock.lock()
+                if let c = self.listFailCounts[path], c > 0 {
+                    self.listFailCounts[path] = c - 1
+                    remainingFail = c
+                }
+                self.lock.unlock()
+                if remainingFail > 0 {
+                    completion(.failure(EngineError.connectionFailed("模拟目录列表失败")))
                     return
                 }
                 if let p = self.failListPath, p == path {
@@ -291,7 +330,7 @@ enum ServiceTests_B {
             prefixCallCount += 1
             let data = remotePrefix
             lock.unlock()
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.02) {
+            DispatchQueue.global().asyncAfter(deadline: .now() + prefixDelay) {
                 if let d = data { completion(.success(d)) }
                 else { completion(.failure(EngineError.ioError("无预置前缀"))) }
             }
@@ -321,8 +360,14 @@ enum ServiceTests_B {
             lock.lock()
             deleteCalls.append(remotePath)
             let fail = failDeletePaths.contains(remotePath)
+            let notFound = notFoundDeletePaths.contains(remotePath)
+            let ioErr = ioErrorDeletePaths.contains(remotePath)
             lock.unlock()
-            DispatchQueue.global().async { completion(fail ? EngineError.permissionDenied("模拟删除失败") : nil) }
+            DispatchQueue.global().async {
+                if notFound { completion(EngineError.remoteNotFound(remotePath)) }
+                else if ioErr { completion(EngineError.ioError("550 Could not delete file")) }
+                else { completion(fail ? EngineError.permissionDenied("模拟删除失败") : nil) }
+            }
         }
         func move(_ endpoint: FTPEndpoint, from: String, to: String, completion: @escaping (Error?) -> Void) {
             lock.lock(); moveCalls.append(MoveCall(from: from, to: to)); lock.unlock()
@@ -332,7 +377,12 @@ enum ServiceTests_B {
             DispatchQueue.global().async { completion(self.allowMKD ? nil : EngineError.unsupported("MKD")) }
         }
         func size(_ endpoint: FTPEndpoint, remotePath: String, completion: @escaping (Result<Int64?, Error>) -> Void) {
-            DispatchQueue.global().async { completion(.success(self.remoteSizes[remotePath])) }
+            lock.lock()
+            let i = sizeCallCount; sizeCallCount += 1
+            let seq = sizeDelays
+            lock.unlock()
+            let delay = seq.map { $0[min(i, $0.count - 1)] } ?? 0
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { completion(.success(self.remoteSizes[remotePath])) }
         }
         func probeCapabilities(_ endpoint: FTPEndpoint, completion: @escaping (Result<Capabilities, Error>) -> Void) {
             DispatchQueue.global().async { completion(.success(Capabilities())) }
@@ -920,7 +970,7 @@ extension ServiceTests_B {
             let box = DeleteBox()
             service.deleteEntries([a], progress: { _, _, _ in }) { box.set($0) }
             waitMain("不支持返回") { box.done }
-            if let err = box.error as? EngineError, case .unsupported = err {} else { assertTrue(false, "不支持删除 → unsupported 错误") }
+            if case .unsupported? = box.error as? EngineError {} else { assertTrue(false, "不支持删除 → unsupported 错误") }
             assertEqual(engine.deleteCalls.count, 0, "不支持时不发起 DELE")
         }
 
@@ -944,8 +994,100 @@ extension ServiceTests_B {
             let box = DeleteBox()
             service.deleteEntries([a], progress: { _, _, _ in }) { box.set($0) }
             waitMain("未连接返回") { box.done }
-            if let err = box.error as? EngineError, case .notConnected = err {} else { assertTrue(false, "未连接 → notConnected 错误") }
+            if case .notConnected? = box.error as? EngineError {} else { assertTrue(false, "未连接 → notConnected 错误") }
             assertEqual(engine.deleteCalls.count, 0, "未连接不发起 DELE")
+        }
+
+        // 6) tolerateMissing：远端已不存在视为删成功（重启补删幂等）；默认仍如实报失败
+        do {
+            let engine = InlineEngine()
+            engine.notFoundDeletePaths = ["/Movies/a.mp4"]
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a, b], tolerateMissing: true, progress: { _, _, _ in }) { box.set($0) }
+            waitMain("补删完成") { box.done }
+            assertEqual(box.outcome?.deletedCount, 2, "notFound 计入删除成功（上次已删掉的项不再算失败）")
+            assertEqual(box.outcome?.failedNames.count, 0, "补删无失败名单")
+
+            let engine2 = InlineEngine()
+            engine2.notFoundDeletePaths = ["/Movies/a.mp4"]
+            let service2 = TVFileService(engineProvider: { engine2 }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                         capabilitiesProvider: { caps })
+            let box2 = DeleteBox()
+            service2.deleteEntries([a, b], progress: { _, _, _ in }) { box2.set($0) }
+            waitMain("默认模式返回") { box2.done }
+            assertEqual(box2.outcome?.deletedCount, 1, "默认不容忍 notFound")
+            assertEqual(box2.outcome?.failedNames, ["a.mp4"], "默认模式 notFound 如实报失败")
+        }
+
+        // 7) fail-safe：ioError（450/未识别 550 泛化失败）+ LIST 证明文件还在 → 不计删成功
+        do {
+            let engine = InlineEngine()
+            engine.ioErrorDeletePaths = ["/Movies/a.mp4"]
+            engine.dirEntriesByPath["/Movies"] = [a, b]
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a, b], tolerateMissing: true, progress: { _, _, _ in }) { box.set($0) }
+            waitMain("ioError 补删返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 1, "ioError 且 LIST 在场 → 不计删成功（fail-open 会谎报已删除）")
+            assertEqual(box.outcome?.failedNames, ["a.mp4"], "ioError 留失败名单 → 登记保留待重试")
+        }
+
+        // 8) G2：ioError（SwiFTP 真机 450）+ LIST 确认缺席 → 计删成功（补删容忍真机生效）
+        do {
+            let engine = InlineEngine()
+            engine.ioErrorDeletePaths = ["/Movies/a.mp4"]
+            engine.dirEntriesByPath["/Movies"] = [b]
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a, b], tolerateMissing: true, progress: { _, _, _ in }) { box.set($0) }
+            waitMain("450 缺席补删返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 2, "450 泛化失败 + LIST 缺席 → 容忍计删成功")
+            assertEqual(box.outcome?.failedNames.count, 0, "缺席确认无失败名单")
+        }
+
+        // 9) fail-safe：ioError + LIST 本身失败 → 证明不了缺席 → 不计删成功
+        do {
+            let engine = InlineEngine()
+            engine.ioErrorDeletePaths = ["/Movies/a.mp4"]
+            engine.failListPath = "/Movies"
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a, b], tolerateMissing: true, progress: { _, _, _ in }) { box.set($0) }
+            waitMain("LIST 失败补删返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 1, "LIST 失败证明不了缺席 → 保留失败")
+            assertEqual(box.outcome?.failedNames, ["a.mp4"], "LIST 失败留失败名单")
+        }
+
+        // 10) 默认模式不做 LIST 确认（ioError 直接报失败，不额外发 LIST）
+        do {
+            let engine = InlineEngine()
+            engine.ioErrorDeletePaths = ["/Movies/a.mp4"]
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a, b], progress: { _, _, _ in }) { box.set($0) }
+            waitMain("默认 ioError 返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 1, "默认模式 ioError 报失败")
+            assertEqual(engine.listCalls, 0, "默认模式不发确认 LIST")
+        }
+
+        // 11) 缺席判定大小写不敏感（U 盘 FAT/exFAT）：LIST 里 A.MP4 视为 a.mp4 还在
+        do {
+            let engine = InlineEngine()
+            engine.ioErrorDeletePaths = ["/Movies/a.mp4"]
+            engine.dirEntriesByPath["/Movies"] = [FTPFileEntry(path: "/Movies/A.MP4", name: "A.MP4", isDirectory: false, size: 5)]
+            let service = TVFileService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                        capabilitiesProvider: { caps })
+            let box = DeleteBox()
+            service.deleteEntries([a, b], tolerateMissing: true, progress: { _, _, _ in }) { box.set($0) }
+            waitMain("大小写在场补删返回") { box.done }
+            assertEqual(box.outcome?.deletedCount, 1, "大小写不敏感：A.MP4 在场 → a.mp4 不算缺席")
+            assertEqual(box.outcome?.failedNames, ["a.mp4"], "大小写在场留失败名单")
         }
     }
 }
@@ -1073,6 +1215,362 @@ extension ServiceTests_B {
             waitUntil("两项都终结") { queue.snapshot().filter { $0.phase == .completed }.count == 2 }
             assertEqual(engine.uploadCalls.count, 1, "同文件重复拖入只传一次")
             assertTrue(queue.snapshot().contains { $0.skippedReason != nil }, "第二份标记跳过")
+        }
+    }
+}
+
+// MARK: - 过期 inflight 快照竞态（clash 判定异步 hop 期间另一项已占位）
+
+extension ServiceTests_B {
+
+    /// 同内容两份拷贝（不同 localPath）+ 远端同尺寸不同内容同名文件：
+    /// 两项都走 clash→指纹→远端前缀比对的异步路径，finalizeUploadRouting 时
+    /// 互不见对方占位。beginUpload 若沿用 finalize 时的 inflight 快照，
+    /// 两项会定出同一个指纹名 → 并发 STOR 同一远端路径。
+    static func testStaleInflightRace() {
+        print("· 过期 inflight 快照竞态")
+        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-stale-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let subA = baseDir.appendingPathComponent("A"); let subB = baseDir.appendingPathComponent("B")
+        try? FileManager.default.createDirectory(at: subA, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: subB, withIntermediateDirectories: true)
+        let fa = subA.appendingPathComponent("同名.mp4"); let fb = subB.appendingPathComponent("同名.mp4")
+        try? Data(repeating: 0xAA, count: 16).write(to: fa)
+        try? Data(repeating: 0xAA, count: 16).write(to: fb) // 内容相同的另一份拷贝
+
+        let caps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
+                                mkdir: false, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+        let engine = InlineEngine()
+        engine.dirEntries = [
+            FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true),
+            FTPFileEntry(path: "/Movies/同名.mp4", name: "同名.mp4", isDirectory: false, size: 16),
+        ]
+        engine.remotePrefix = Data(repeating: 0xFF, count: 16) // 同尺寸、不同内容 → 前缀比对判「不同」
+        engine.prefixDelay = 0.3 // 拉宽窗口：两项都在对方占位前完成 finalize
+        let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                 capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("q"),
+                                 concurrency: 2, resumeOnStart: true)
+        queue.addUploads([fa, fb])
+        waitUntil("两项都完成") { queue.snapshot().filter { $0.phase == .completed }.count == 2 }
+        assertEqual(engine.uploadCalls.count, 2, "两份拷贝都实际上传（localPath 不同，不收敛跳过）")
+        let p0 = engine.uploadCalls[0].remotePath.lowercased()
+        let p1 = engine.uploadCalls[1].remotePath.lowercased()
+        assertTrue(p0 != p1, "异步 hop 后定名必须现算 inflight：两项不得并发 STOR 同一远端路径")
+        queue.suspendForShutdown()
+    }
+}
+
+// MARK: - 批次完成回调必须在重试后重新武装（「删除前先下载」续删依赖它）
+
+extension ServiceTests_B {
+
+    /// 整批失败 → 回调一次；重试一项成功（另一项仍失败）→ 批次再次全终态，回调必须再发；
+    /// 全部重试成功 → 回调第三次且 bad==0（这是续删的触发点）。
+    /// 若 batchNotified 不随重试移除，后两次回调丢失 → 取回成功后删除永远不会执行。
+    static func testBatchRetryRearm() {
+        print("· 批次完成回调重试后重新武装")
+        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-rearm-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let dlDir = baseDir.appendingPathComponent("dl")
+        try? FileManager.default.createDirectory(at: dlDir, withIntermediateDirectories: true)
+        let caps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
+                                mkdir: false, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+        let engine = InlineEngine()
+        engine.hangDownloads = true
+        let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                 capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("q"),
+                                 concurrency: 2, resumeOnStart: true)
+        let lock = NSLock()
+        var fires: [(ok: Int, bad: Int)] = []
+        queue.onBatchCompleted = { _, ok, bad in lock.lock(); fires.append((ok, bad)); lock.unlock() }
+        func fireCount() -> Int { lock.lock(); defer { lock.unlock() }; return fires.count }
+
+        let items = queue.addDownloads([
+            FTPFileEntry(path: "/a/x.mp4", name: "x.mp4", isDirectory: false, size: 1),
+            FTPFileEntry(path: "/a/y.mp4", name: "y.mp4", isDirectory: false, size: 1),
+        ], toDirectory: dlDir)
+        assertEqual(items.count, 2, "两项都入队")
+        waitUntil("两项起传") { queue.snapshot().filter { $0.phase == .running }.count == 2 }
+        engine.releaseAllDownloads(.failure(EngineError.connectionFailed("模拟断线")))
+        waitMain("整批失败 → 首次完成回调") { fireCount() == 1 }
+
+        engine.hangDownloads = false
+        queue.retry(id: items[0].id)
+        waitMain("重试一项成功 → 回调重新武装并再发") { fireCount() == 2 }
+        lock.lock(); let second = fires.count > 1 ? fires[1] : (ok: -1, bad: -1); lock.unlock()
+        assertEqual(second.ok, 1, "第二次回调：一项成功")
+        assertEqual(second.bad, 1, "第二次回调：一项仍失败")
+
+        queue.retry(id: items[1].id)
+        waitMain("全部重试成功 → 第三次回调") { fireCount() == 3 }
+        lock.lock(); let third = fires.count > 2 ? fires[2] : (ok: -1, bad: -1); lock.unlock()
+        assertEqual(third.ok, 2, "第三次回调：两项全部成功")
+        assertEqual(third.bad, 0, "bad==0 才会触发续删")
+        queue.suspendForShutdown()
+    }
+}
+
+// MARK: - 存放位置持久化（设计稿 docs/20261119_design_upload_target.md v2 §7）
+
+extension ServiceTests_B {
+
+    static func testUploadTargetPersistence() {
+        print("· 存放位置持久化（customUploadDir / recentUploadDirs）")
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-target-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = TVStore(directory: dir)
+        assertTrue(store.state.customUploadDir == nil, "初始无指定位置（智能分类）")
+        store.setUploadTarget("/电视剧/庆余年2")
+        store.recordRecentUploadDir("/电视剧/庆余年2")
+        store.recordRecentUploadDir("/电影")
+        store.recordRecentUploadDir("/电视剧/庆余年2")
+
+        // 新实例（模拟重启）读回
+        let store2 = TVStore(directory: dir)
+        assertEqual(store2.state.customUploadDir, "/电视剧/庆余年2", "customUploadDir round-trip")
+        assertEqual(store2.state.recentUploadDirs, ["/电视剧/庆余年2", "/电影"], "recentUploadDirs 去重且最新在前")
+
+        // 恢复智能分类：目标清空，最近记录保留
+        store.setUploadTarget(nil)
+        let store3 = TVStore(directory: dir)
+        assertTrue(store3.state.customUploadDir == nil, "恢复智能分类后落盘为 nil")
+        assertEqual(store3.state.recentUploadDirs, ["/电视剧/庆余年2", "/电影"], "恢复分类不清最近记录")
+
+        // pushRecentDir 纯逻辑：上限 5、去重、最新在前
+        var list: [String]? = nil
+        for i in 1...7 { list = TVStore.pushRecentDir(list, "/目录\(i)") }
+        assertEqual(list?.count, 5, "最近目录上限 5")
+        assertEqual(list?.first, "/目录7", "最新在前")
+        assertEqual(list?.last, "/目录3", "最旧的被截断")
+        assertEqual(TVStore.pushRecentDir(["/a", "/b"], "/a"), ["/a", "/b"], "重复推入 → 移到最前不堆积")
+
+        // 旧版本 tv.json（无新字段）→ 解码 nil，无感升级（边界场景 #9）
+        let legacyJSON = "{\"endpoint\":{\"host\":\"1.2.3.4\",\"port\":2121},\"onboardingDone\":true}".data(using: .utf8)!
+        try! legacyJSON.write(to: dir.appendingPathComponent("tv.json"))
+        let store4 = TVStore(directory: dir)
+        assertTrue(store4.state.customUploadDir == nil, "旧 JSON 缺 customUploadDir → nil")
+        assertTrue(store4.state.recentUploadDirs == nil, "旧 JSON 缺 recentUploadDirs → nil")
+        assertEqual(store4.endpoint?.host, "1.2.3.4", "旧 JSON 其余字段照常读回")
+    }
+
+    static func testQueueItemDirOverrideRoundTrip() {
+        print("· 队列项批级目标 dirOverride round-trip")
+        var it = QueueItem(direction: .upload, kind: .video, localPath: "/tmp/a.mp4",
+                           displayName: "a.mp4", sizeBytes: 100)
+        assertTrue(it.dirOverride == nil, "默认无批级目标（跟随全局存放位置/智能分流）")
+        it.dirOverride = "/剧集/庆余年2"
+
+        let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+        let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601
+        let back = (try! dec.decode([QueueItem].self, from: try! enc.encode([it]))).first!
+        assertEqual(back.dirOverride, "/剧集/庆余年2", "dirOverride 随 queue.json 持久化（重启恢复不丢批级目标）")
+
+        // 旧版本队列 JSON（无 dirOverride 字段）→ nil
+        let legacy = ("[{\"id\":\"x\",\"direction\":\"upload\",\"kind\":\"video\",\"localPath\":\"/tmp/a.mp4\","
+            + "\"displayName\":\"a.mp4\",\"sizeBytes\":100,\"phase\":\"queued\",\"bytes\":0,\"bytesPerSecond\":0,"
+            + "\"needsNameMapping\":false,\"batchId\":\"b\",\"addedAt\":\"2026-11-19T00:00:00Z\",\"autoPaused\":false}]").data(using: .utf8)!
+        let old = (try! dec.decode([QueueItem].self, from: legacy)).first!
+        assertTrue(old.dirOverride == nil, "旧 JSON 缺 dirOverride → nil")
+    }
+}
+
+// MARK: - 定名盲区：异步 hop 期间已完成的兄弟项（inflight 与 dirList 快照都看不见）
+
+extension ServiceTests_B {
+
+    /// 同名不同内容两份、远端无同名（无 clash → 用原名，不走指纹名）：
+    /// A 的 LIST/SIZE 快、B 的慢 → A 在 B 的 hop 期间完成。定名若只查
+    /// inflight + dirList 快照，B 会原名 STOR 覆盖 A 刚传好的不同内容文件。
+    static func testCompletedSiblingBlindSpot() {
+        print("· 已完成兄弟项定名盲区")
+        let baseDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-sibling-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+        let subA = baseDir.appendingPathComponent("A"); let subB = baseDir.appendingPathComponent("B")
+        try? FileManager.default.createDirectory(at: subA, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: subB, withIntermediateDirectories: true)
+        let fa = subA.appendingPathComponent("同名.mp4"); let fb = subB.appendingPathComponent("同名.mp4")
+        try? Data(repeating: 0xAA, count: 16).write(to: fa)
+        try? Data(repeating: 0xBB, count: 16).write(to: fb) // 不同内容 → 覆盖即丢数据
+        let caps = Capabilities(utf8Filenames: false, appeResume: true, restResume: false,
+                                mkdir: false, deleteFile: true, rename: true, mlsd: false, sizeCommand: true)
+        let movies = FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true)
+
+        // 1) 主路径：B 的 LIST hop 期间 A 完成
+        do {
+            let engine = InlineEngine()
+            engine.dirEntries = [movies] // 远端无同名 → 无 clash → 原名定名
+            engine.listDelays = [0.02, 0.5]
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("q1"),
+                                     concurrency: 2, resumeOnStart: true)
+            queue.addUploads([fa, fb])
+            waitUntil("两项都完成") { queue.snapshot().filter { $0.phase == .completed }.count == 2 }
+            assertEqual(engine.uploadCalls.count, 2, "两项都上传")
+            let p0 = engine.uploadCalls[0].remotePath.lowercased()
+            let p1 = engine.uploadCalls[1].remotePath.lowercased()
+            assertTrue(p0 != p1, "hop 期间完成的兄弟项占名必须可见：不得原名 STOR 覆盖其不同内容文件")
+            queue.suspendForShutdown()
+        }
+
+        // 2) 降级路径（LIST 全失败 → SIZE hop）：B 的 SIZE hop 期间 A 完成
+        do {
+            let engine = InlineEngine()
+            engine.failAllLists = true
+            engine.sizeDelays = [0.02, 0.5]
+            let queue = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                                     capabilitiesProvider: { caps }, persistenceDirectory: baseDir.appendingPathComponent("q2"),
+                                     concurrency: 2, resumeOnStart: true)
+            queue.addUploads([fa, fb])
+            waitUntil("两项降级完成") { queue.snapshot().filter { $0.phase == .completed }.count == 2 }
+            assertEqual(engine.uploadCalls.count, 2, "降级两项都上传")
+            let p0 = engine.uploadCalls[0].remotePath.lowercased()
+            let p1 = engine.uploadCalls[1].remotePath.lowercased()
+            assertTrue(p0 != p1, "降级定名同样要查已完成兄弟项占名")
+            queue.suspendForShutdown()
+        }
+    }
+}
+
+// MARK: - 指定存放位置上传（设计稿 docs/20261119_design_upload_target.md v2 §6.1 两层解析 + §6.3 失效降级）
+
+extension ServiceTests_B {
+
+    /// 构造：单并发队列 + 注入全局指定目录（AppCoordinator 场景：targetDirProvider 读 TVStore 快照）
+    static func makeTargetQueue(_ engine: InlineEngine, _ dir: URL, global: String?) -> QueueService {
+        let q = QueueService(engineProvider: { engine }, endpointProvider: { FTPEndpoint(host: "mock") },
+                             capabilitiesProvider: { Capabilities() },
+                             persistenceDirectory: dir, concurrency: 1, resumeOnStart: true)
+        q.targetDirProvider = { global }
+        return q
+    }
+
+    static func testExplicitTargetDirRouting() {
+        print("· 指定存放位置：两层解析与混合批次")
+        let base = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-expr-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let fv = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-expr-v-\(UUID().uuidString).mp4")
+        try! Data(repeating: 1, count: 64).write(to: fv)
+        defer { try? FileManager.default.removeItem(at: fv) }
+        let fi = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-expr-i-\(UUID().uuidString).jpg")
+        try! Data(repeating: 2, count: 64).write(to: fi)
+        defer { try? FileManager.default.removeItem(at: fi) }
+        let fo = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-expr-o-\(UUID().uuidString).txt")
+        try! Data(repeating: 3, count: 64).write(to: fo)
+        defer { try? FileManager.default.removeItem(at: fo) }
+
+        // 1) 批级目标（深层目录）直列：跳过根 LIST，落指定目录
+        do {
+            let engine = InlineEngine()
+            let target = "/剧集/庆余年2"
+            engine.dirEntriesByPath[target] = []
+            let q = makeTargetQueue(engine, base.appendingPathComponent("t1"), global: nil)
+            let items = q.addUploads([fv], targetDir: target)
+            assertEqual(items.first?.dirOverride, target, "批级目标写入任务项 dirOverride")
+            waitUntil("批级目标上传完成") { q.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, target + "/" + fv.lastPathComponent, "深层指定目录直列")
+            assertEqual(q.snapshot().first?.remoteDir, target, "卡片目标 = 指定目录")
+            assertEqual(engine.listCalls, 1, "只 LIST 一次（直列目标目录，无根 LIST 前置跳）")
+        }
+
+        // 2) 全局指定 + 混合批次：视频/图片/其他 全部进同一指定目录（设计稿 §6.2）
+        do {
+            let engine = InlineEngine()
+            let target = "/家庭相册"
+            engine.dirEntriesByPath[target] = []
+            let q = makeTargetQueue(engine, base.appendingPathComponent("t2"), global: target)
+            _ = q.addUploads([fv, fi, fo])
+            waitUntil("混合批次全部完成") { q.snapshot().filter { $0.phase == .completed }.count == 3 }
+            for it in q.snapshot() {
+                assertEqual(it.remoteDir, target, "混合批次全部进指定目录（含 .other）")
+            }
+            let dirs = Set(engine.uploadCalls.map { ($0.remotePath as NSString).deletingLastPathComponent })
+            assertEqual(dirs, Set([target]), "引擎层三个文件同目录")
+        }
+
+        // 3) 全局指定根目录：显式「/」= 原名入根
+        do {
+            let engine = InlineEngine()
+            let q = makeTargetQueue(engine, base.appendingPathComponent("t3"), global: "/")
+            _ = q.addUploads([fv])
+            waitUntil("根目录上传完成") { q.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, "/" + fv.lastPathComponent, "指定根目录 = 原名入根")
+            assertEqual(q.snapshot().first?.remoteDir, "/", "卡片显示电视根目录")
+        }
+
+        // 4) 批级目标优先于全局指定（两层解析的任务项层覆盖）
+        do {
+            let engine = InlineEngine()
+            let batchTarget = "/批级"
+            let globalTarget = "/全局"
+            engine.dirEntriesByPath[batchTarget] = []
+            engine.dirEntriesByPath[globalTarget] = []
+            let q = makeTargetQueue(engine, base.appendingPathComponent("t4"), global: globalTarget)
+            _ = q.addUploads([fv], targetDir: batchTarget)
+            waitUntil("批级覆盖完成") { q.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, batchTarget + "/" + fv.lastPathComponent, "批级目标优先于全局指定")
+        }
+    }
+
+    static func testCustomTargetDegradation() {
+        print("· 指定目录失效降级（MKD 兜底 / 回根 + 每批一次告知）")
+        let base = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-deg-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        let f1 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-deg-a-\(UUID().uuidString).mp4")
+        try! Data(repeating: 9, count: 64).write(to: f1)
+        defer { try? FileManager.default.removeItem(at: f1) }
+        let f2 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-deg-b-\(UUID().uuidString).mp4")
+        try! Data(repeating: 8, count: 64).write(to: f2)
+        defer { try? FileManager.default.removeItem(at: f2) }
+
+        // 1) 目录消失 + MKD 被拒（真机 550 语义）→ 回根目录 + 每批一次降级告知（D6）
+        do {
+            let engine = InlineEngine()
+            let target = "/没了"
+            engine.failListPath = target
+            engine.allowMKD = false
+            let q = makeTargetQueue(engine, base.appendingPathComponent("d1"), global: nil)
+            let lock = NSLock()
+            var fallbackDirs: [String] = []
+            q.onUploadFallback = { _, dir in lock.lock(); fallbackDirs.append(dir); lock.unlock() }
+            _ = q.addUploads([f1, f2], targetDir: target)
+            waitUntil("两项降级回根完成") { q.snapshot().filter { $0.phase == .completed }.count == 2 }
+            waitMain("降级告知送达主队列") {
+                lock.lock(); let c = fallbackDirs.count; lock.unlock(); return c == 1
+            }
+            assertEqual(fallbackDirs.first, target, "告知携带失效目录")
+            for it in q.snapshot() {
+                assertEqual(it.remoteDir, "/", "失效目录 → 回根（D6 终点）")
+            }
+            let dirs = Set(engine.uploadCalls.map { ($0.remotePath as NSString).deletingLastPathComponent })
+            assertEqual(dirs, Set(["/"]), "两项实际都落在根目录")
+        }
+
+        // 2) 目录消失 + MKD 成功 → 重建后归入指定目录，无降级告知
+        do {
+            let engine = InlineEngine()
+            let target = "/重建"
+            engine.listFailCounts = [target: 1] // 首列失败（目录没了）→ MKD 成功 → 再列成功
+            engine.allowMKD = true
+            let q = makeTargetQueue(engine, base.appendingPathComponent("d2"), global: nil)
+            let lock = NSLock()
+            var fallbackCount = 0
+            q.onUploadFallback = { _, _ in lock.lock(); fallbackCount += 1; lock.unlock() }
+            _ = q.addUploads([f1], targetDir: target)
+            waitUntil("MKD 重建后完成") { q.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, target + "/" + f1.lastPathComponent, "MKD 重建后归入指定目录")
+            waitMain("重建成功不发降级告知") {
+                lock.lock(); let c = fallbackCount; lock.unlock(); return c == 0
+            }
+        }
+
+        // 3) 智能分流回归：未指定时保持现状（视频 → /Movies）
+        do {
+            let engine = InlineEngine()
+            let q = makeTargetQueue(engine, base.appendingPathComponent("d3"), global: nil)
+            _ = q.addUploads([f1])
+            waitUntil("智能分流完成") { q.snapshot().first?.phase == .completed }
+            assertEqual(engine.uploadCalls.first?.remotePath, "/Movies/" + f1.lastPathComponent, "未指定 → 智能分流行为不变")
         }
     }
 }

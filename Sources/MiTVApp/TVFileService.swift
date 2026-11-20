@@ -48,6 +48,18 @@ final class TVFileService {
         }
     }
 
+    /// 建目录（MKD，选择存放位置弹窗用）。caps.mkdir=false 的设备上 UI 门控不发起；
+    /// 探测后能力变化的竞态在此如实失败（设计稿 v2 §5.2/D1）
+    func makeDirectory(_ path: String, completion: @escaping (Error?) -> Void) {
+        guard let endpoint = endpointProvider() else {
+            completion(EngineError.notConnected)
+            return
+        }
+        engineProvider().makeDirectory(endpoint, path: path) { error in
+            DispatchQueue.main.async { completion(error) }
+        }
+    }
+
     // MARK: 删除（直删 DELE，永久不可撤销）
 
     /// 当前能力下的删除策略（UI 用它决定按钮与文案）
@@ -62,7 +74,9 @@ final class TVFileService {
     }
 
     /// 批量直删。progress(done, total, name) 主队列；completion 返回成功数与失败名单。
+    /// tolerateMissing：远端已不存在视为删除成功（重启补删时，上次已删掉的项不应再算失败）
     func deleteEntries(_ entries: [FTPFileEntry],
+                       tolerateMissing: Bool = false,
                        progress: @escaping (_ done: Int, _ total: Int, _ name: String) -> Void,
                        completion: @escaping (Result<DeleteOutcome, Error>) -> Void) {
         let files = entries.filter { !$0.isDirectory }
@@ -88,9 +102,31 @@ final class TVFileService {
             let entry = files[i]
             progress(i, total, entry.name)
             engine.delete(endpoint, remotePath: entry.path) { error in
-                if error == nil { deleted += 1 } else { failedNames.append(entry.name) }
-                progress(i + 1, total, entry.name)
-                step(i + 1)
+                func finish(ok: Bool) {
+                    if ok { deleted += 1 } else { failedNames.append(entry.name) }
+                    progress(i + 1, total, entry.name)
+                    step(i + 1)
+                }
+                if error == nil { finish(ok: true); return }
+                if tolerateMissing, let e = error as? EngineError, case .remoteNotFound = e {
+                    finish(ok: true)
+                    return
+                }
+                if tolerateMissing {
+                    // SwiFTP 真机删除失败回 450 泛化文本，证明不了缺席：
+                    // LIST 父目录确认名字不在才计删成功，否则保留失败（fail-safe）
+                    let parent = (entry.path as NSString).deletingLastPathComponent
+                    engine.list(endpoint, path: parent.isEmpty ? "/" : parent) { result in
+                        if case .success(let list) = result,
+                           !list.contains(where: { $0.name.lowercased() == entry.name.lowercased() }) {
+                            finish(ok: true)
+                        } else {
+                            finish(ok: false)
+                        }
+                    }
+                    return
+                }
+                finish(ok: false)
             }
         }
         step(0)

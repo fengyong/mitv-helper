@@ -50,11 +50,14 @@ final class AppCoordinator: NSObject {
     private var connecting = false
     private var yellowBannerUp = false
     private var photoPicker: PhotoPickerController?
+    private var locationPicker: DirPickerController?
     private var onboarding: OnboardingOverlay?
     var confirmOverlay: ConfirmOverlay? // 冒烟自动化需要访问；正常流程不受影响
     private var settingsController: SettingsController?
     /// 「删除前先下载」的批次登记：batchId → (待删文件, 完成回调)。整批取回成功后才执行删除
     private var pendingDeleteBatches: [String: (files: [FTPFileEntry], after: () -> Void)] = [:]
+    /// 正在执行删除的批次（防止重连补删与完成回调重复触发同一批删除）
+    private var deletingBatches: Set<String> = []
     /// 未连接时拖入的文件：先记下，连上后自动入队（旧实现直接丢弃，用户白拖一趟）
     private var pendingDropURLs: [URL] = []
 
@@ -98,6 +101,7 @@ final class AppCoordinator: NSObject {
         assembleWindow()
         header.onNav = { [weak self] nav in self?.handleNav(nav) }
         header.onCapsuleTap = { [weak self] in self?.capsuleTapped() }
+        header.onLocationTap = { [weak self] in self?.openLocationPicker() }
         header.onSettingsTap = { [weak self] in self?.openSettings() }
     }
 
@@ -173,6 +177,12 @@ final class AppCoordinator: NSObject {
         queue.onBatchCompleted = { [weak self] batchId, ok, bad in
             self?.handleBatchCompleted(batchId: batchId, ok: ok, bad: bad)
         }
+        // 存放位置（设计稿 v2 §6.1/§6.3）：全局指定目录注入队列；失效降级回根目录后告知（D6，
+        // 每批至多一次由 QueueService 去重）
+        queue.targetDirProvider = { [weak self] in self?.store.state.customUploadDir }
+        queue.onUploadFallback = { [weak self] _, _ in
+            self?.showToast("指定的位置已不在电视上，文件已放到电视根目录")
+        }
         loadPendingDeletes()
         heartbeat.onStatus = { [weak self] status in self?.handleHeartbeat(status) }
 
@@ -225,6 +235,11 @@ final class AppCoordinator: NSObject {
         if auto == "picker" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 self?.openPhotoPicker()
+            }
+        }
+        if auto == "location" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.openLocationPicker()
             }
         }
         if auto == "settings" {
@@ -352,6 +367,7 @@ final class AppCoordinator: NSObject {
     }
 
     private func handleQueueChanged() {
+        abandonOrphanedPendingDeletes()
         if mode == .home {
             let has = queue.snapshot().isEmpty == false
             let current = content.subviews.first
@@ -418,6 +434,7 @@ final class AppCoordinator: NSObject {
                     self.pendingDropURLs = []
                     self.enqueueFileURLs(urls)
                 }
+                self.catchUpPendingDeletes()
                 completion?(true, nil)
             case .failure(let error):
                 self.heartbeatStatus = .off
@@ -437,6 +454,9 @@ final class AppCoordinator: NSObject {
                 queue.autoResumeAfterReconnect()
                 showToast("电视已重新连接")
             }
+            // 心跳自动重连也是「下次连接」：删除失败保留的登记必须在这里续删，
+            // 否则 toast 承诺的自动重试只在重启/手动重连时兑现
+            catchUpPendingDeletes()
         case .lost(let attempt):
             yellowBannerUp = true
             banner.show("电视连接不上 · 正在重试（第 \(attempt) 次）… 文件已自动暂停")
@@ -458,6 +478,7 @@ final class AppCoordinator: NSObject {
         case .off:
             header.capsule.setLook(.off, store.endpoint == nil ? "未连接电视 · 点此连接" : "\(name) · 连接不上 · 点此重连")
         }
+        header.locationChip.setTarget(store.state.customUploadDir)
         if mode == .browser, heartbeatStatus == .off, store.endpoint != nil {
             // 掉线时浏览态停留但列表不可操作（由浏览器自己展示空态）
         }
@@ -494,6 +515,7 @@ final class AppCoordinator: NSObject {
         }
         if result.ignored > 0 { showToast("已忽略 \(result.ignored) 个不支持的项目") }
         queue.addUploads(result.media)
+        announceTargetIfCustom(count: result.media.count)
         setMode(.home)
     }
 
@@ -501,17 +523,63 @@ final class AppCoordinator: NSObject {
     func enqueueStaged(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
         queue.addUploads(urls)
+        announceTargetIfCustom(count: urls.count)
         setMode(.home)
     }
 
+    // MARK: - 存放位置（chip 与设置页共用入口，设计稿 v2 §5.1/§5.5/D7）
+
+    /// 打开「选择存放位置」弹窗。未连接拦截（设计稿 §6.4）
+    func openLocationPicker() {
+        guard store.endpoint != nil, store.state.onboardingDone else {
+            showToast("先连接电视才能选择存放位置")
+            return
+        }
+        guard locationPicker == nil else { return }
+        let picker = DirPickerController(coordinator: self)
+        picker.onPicked = { [weak self] dir in
+            guard let self = self else { return }
+            self.locationPicker = nil
+            self.applyUploadTarget(dir)
+        }
+        picker.onClose = { [weak self] in self?.locationPicker = nil }
+        locationPicker = picker
+        picker.present(asSheetOf: window)
+    }
+
+    /// 应用选择结果并刷新 chip：nil = 恢复智能分类；非 nil = 指定目录（记录最近使用供快切）
+    func applyUploadTarget(_ dir: String?) {
+        if let dir = dir {
+            store.setUploadTarget(dir)
+            store.recordRecentUploadDir(dir)
+            showToast("已指定存放位置：\(targetDisplayPath(dir))")
+        } else {
+            store.setUploadTarget(nil)
+            showToast("已恢复智能分类")
+        }
+        refreshHeader()
+    }
+
+    /// 界面显示名：去开头斜杠的完整层级（与队列卡片同源）；根目录叫「电视根目录」
+    func targetDisplayPath(_ dir: String) -> String {
+        dir == "/" ? "电视根目录" : String(dir.dropFirst())
+    }
+
+    /// 指定模式入队落点提示（设计稿 v2 §6.2/D3）：全局指定模式是常驻隐藏状态，chip 可见 ≠ 后果可见，
+    /// 动作时刻报落点消除「照片悄悄进了电视剧目录」式惊讶；智能分类维持现状不加噪
+    private func announceTargetIfCustom(count: Int) {
+        guard let dir = store.state.customUploadDir else { return }
+        showToast("\(count) 个文件即将存到 \(targetDisplayPath(dir))")
+    }
+
     private func handleBatchCompleted(batchId: String, ok: Int, bad: Int) {
-        // 「删除前先下载」的批次：整批取回成功才执行删除，失败则中止（数据安全兜底）
-        if let pending = pendingDeleteBatches.removeValue(forKey: batchId) {
-            savePendingDeletes()
+        // 「删除前先下载」的批次：整批取回成功才执行删除；有失败则保留登记，
+        // 重试取回成功后完成回调会再次触发（QueueService 重试时重新武装批次通知）
+        if let pending = pendingDeleteBatches[batchId] {
             if bad == 0 {
-                deleteRemote(pending.files, after: pending.after)
+                runPendingDelete(batchId: batchId, tolerateMissing: false)
             } else {
-                showToast("取回没有全部成功，已取消删除 · 可重试取回后再删")
+                showToast("取回没有全部成功，已暂停删除 · 重试取回成功后会自动继续删除")
                 pending.after()
             }
             return
@@ -586,6 +654,7 @@ final class AppCoordinator: NSObject {
             guard let self = self else { return }
             if !media.isEmpty {
                 self.queue.addUploads(media)
+                self.announceTargetIfCustom(count: media.count)
                 self.setMode(.home)
             }
             if ignored > 0 { self.showToast("已忽略 \(ignored) 个不支持的项目") }
@@ -641,15 +710,17 @@ final class AppCoordinator: NSObject {
         deleteRemote(filesToDelete, after: after)
     }
 
-    private func deleteRemote(_ filesToDelete: [FTPFileEntry], after: @escaping () -> Void) {
+    private func deleteRemote(_ filesToDelete: [FTPFileEntry], tolerateMissing: Bool = false,
+                              after: @escaping () -> Void, onFullyDeleted: (() -> Void)? = nil) {
         let total = filesToDelete.count
         showToast("正在移除 \(total) 项…")
-        files.deleteEntries(filesToDelete, progress: { _, _, _ in }) { [weak self] result in
+        files.deleteEntries(filesToDelete, tolerateMissing: tolerateMissing, progress: { _, _, _ in }) { [weak self] result in
             guard let self = self else { return }
             switch result {
             case .success(let outcome):
                 if outcome.failedNames.isEmpty {
                     self.showToast("已永久删除 \(outcome.deletedCount) 项")
+                    onFullyDeleted?()
                 } else if outcome.deletedCount > 0 {
                     self.showToast("已永久删除 \(outcome.deletedCount) 项 · \(outcome.failedNames.count) 项没有成功")
                 } else {
@@ -662,7 +733,66 @@ final class AppCoordinator: NSObject {
         }
     }
 
+    /// 执行「删除前先下载」的删除。登记保留到全部删成功才移除：
+    /// 删除中途进程被杀，重启后凭登记补删（已删掉的项 tolerateMissing 容忍）
+    private func runPendingDelete(batchId: String, tolerateMissing: Bool) {
+        guard let pending = pendingDeleteBatches[batchId], !deletingBatches.contains(batchId) else { return }
+        deletingBatches.insert(batchId)
+        deleteRemote(pending.files, tolerateMissing: tolerateMissing, after: { [weak self] in
+            guard let self = self else { return }
+            self.deletingBatches.remove(batchId)
+            self.abandonOrphanedPendingDeletes()
+            if self.pendingDeleteBatches[batchId] != nil {
+                self.showToast("还有文件没有删掉 · 下次连接电视后会自动重试")
+            }
+            pending.after()
+        }, onFullyDeleted: { [weak self] in
+            guard let self = self else { return }
+            self.pendingDeleteBatches.removeValue(forKey: batchId)
+            self.savePendingDeletes()
+        })
+    }
+
+    /// 连接成功后补删：重启前已整批取回成功的批次，重启后不会再触发 onBatchCompleted
+    /// （全终态批次的完成通知在 init 时已预置），必须在这里主动续删，否则删除意图永久丢失
+    private func catchUpPendingDeletes() {
+        let snapshot = queue.snapshot()
+        for batchId in Array(pendingDeleteBatches.keys) {
+            let members = snapshot.filter { $0.batchId == batchId }
+            guard !members.isEmpty, members.allSatisfy({ $0.phase == .completed }) else { continue }
+            runPendingDelete(batchId: batchId, tolerateMissing: true)
+        }
+    }
+
+    /// 清空已完成/单项移除把在册批次的成员清光 → 视为用户放弃删除：显式摘登记 + 告知。
+    /// 不许静默作废（toast 承诺过自动重试）；也不许对空成员执行删除——
+    /// 「取回全部成功」这条数据安全前提已无法验证
+    private func abandonOrphanedPendingDeletes() {
+        guard !pendingDeleteBatches.isEmpty else { return }
+        let snapshot = queue.snapshot()
+        for batchId in Array(pendingDeleteBatches.keys) {
+            guard !deletingBatches.contains(batchId),
+                  !snapshot.contains(where: { $0.batchId == batchId }),
+                  let pending = pendingDeleteBatches.removeValue(forKey: batchId) else { continue }
+            savePendingDeletes()
+            showToast("已放弃删除 \(pending.files.count) 项 · 文件仍留在电视上")
+        }
+    }
+
     // MARK: - 浏览态下载
+
+    /// 浏览页「上传到这里」（设计稿 v2 §5.3）：以当前浏览目录为批级目标入队，**不修改**全局存放位置。
+    /// D5：首版不接照片图库入口——组合路径「chip 设指定 + 主页从照片图库挑选」已覆盖能力
+    func uploadHere(at dir: String) {
+        picks.chooseMedia(on: window) { [weak self] media, ignored in
+            guard let self = self else { return }
+            if ignored > 0 { self.showToast("已忽略 \(ignored) 个不支持的项目") }
+            guard !media.isEmpty else { return }
+            self.queue.addUploads(media, targetDir: dir)
+            self.setMode(.home)
+            self.showToast("\(media.count) 个文件即将存到 \(self.targetDisplayPath(dir))")
+        }
+    }
 
     func downloadEntries(_ entries: [FTPFileEntry], completion: ((Bool) -> Void)? = nil) {
         guard !entries.isEmpty else { completion?(false); return }

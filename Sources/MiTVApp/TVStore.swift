@@ -9,6 +9,11 @@ struct TVPersistState: Codable, Equatable {
     /// 浏览上次所在目录
     var lastRemotePath: String?
     var onboardingDone: Bool = false
+    /// 存放位置：全局自定义上传目录（nil = 智能分类：视频 Movies、照片 Pictures、其他根目录）
+    /// 设计稿 docs/20261119_design_upload_target.md v2 §7
+    var customUploadDir: String?
+    /// 最近使用的指定目录（最新在前、去重、上限 5），选择器快切用
+    var recentUploadDirs: [String]?
 }
 
 /// 电视信息持久化：endpoint + capabilities + 上次目录。
@@ -62,6 +67,27 @@ final class TVStore {
 
     func setLastRemotePath(_ path: String?) {
         update { $0.lastRemotePath = path }
+    }
+
+    // MARK: 存放位置（设计稿 v2 §5/§7）
+
+    /// 写入/清除全局指定目录（nil = 恢复智能分类）
+    func setUploadTarget(_ dir: String?) {
+        update { $0.customUploadDir = dir }
+    }
+
+    /// 确认指定位置时记录最近使用（去重、最新在前、上限 5）
+    func recordRecentUploadDir(_ dir: String) {
+        update { $0.recentUploadDirs = TVStore.pushRecentDir($0.recentUploadDirs, dir) }
+    }
+
+    /// 最近目录推送（纯函数可测试）：去重、最新在前、截断到上限
+    static func pushRecentDir(_ list: [String]?, _ dir: String, limit: Int = 5) -> [String] {
+        var out = list ?? []
+        out.removeAll { $0 == dir }
+        out.insert(dir, at: 0)
+        if out.count > limit { out.removeLast(out.count - limit) }
+        return out
     }
 
     // MARK: - 私有

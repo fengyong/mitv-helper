@@ -19,6 +19,12 @@ enum FTPPath {
         if p == "/" { return "/" + name }
         return p + "/" + name
     }
+
+    /// SIZE 用拆分：SwiFTP 拒绝含 `/` 的 SIZE 参数（550 traversal），须 CWD 父目录后发裸名
+    static func sizeSplit(_ path: String) -> (dir: String, name: String) {
+        let ns = path as NSString
+        return (ns.deletingLastPathComponent, ns.lastPathComponent)
+    }
 }
 
 // MARK: - 控制通道响应
@@ -94,11 +100,24 @@ enum FTPErrorMapper {
             switch op {
             case .stor, .appe, .mkd, .rnto, .rmd:
                 return .permissionDenied(text) // 写操作被拒（如 SwiFTP MKD 550）
+            case .dele:
+                // 未识别 550 不等于文件不存在（U 盘拔出/写保护也回 550）：
+                // 落 remoteNotFound 会被补删 tolerateMissing 计为删成功 → fail-open 谎报
+                return .ioError(text)
             default:
                 return .remoteNotFound(text)
             }
         case 552:
             return .ioError("服务器存储超限：\(text)")
+        case 450:
+            switch op {
+            case .dele, .rnfr, .rnto:
+                // SwiFTP 真机删除/改名失败统一 450 泛化文本，区分不了缺失与写保护：
+                // 落 ioError（文件可能还在）；补删的缺席确认由服务层 LIST 负责
+                return .ioError(text)
+            default:
+                return .connectionFailed("服务器临时错误 \(code)：\(text)")
+            }
         case 100...499:
             return .connectionFailed("服务器临时错误 \(code)：\(text)")
         default:
@@ -422,8 +441,11 @@ final class FTPControlConnection {
     }
 
     /// SIZE；nil = 目录或不存在（不视为错误）；SIZE 命令本身不被支持（502）→ unsupported
+    /// SwiFTP 真机 SIZE 拒绝含 `/` 的路径（550 traversal）：先 CWD 父目录再发裸名
     func remoteSize(_ path: String) throws -> Int64? {
-        try send("SIZE", arg: path)
+        let (dir, name) = FTPPath.sizeSplit(path)
+        if !dir.isEmpty && dir != "/" { try cwd(dir) }
+        try send("SIZE", arg: name)
         let r = try readReply()
         if r.code == 213 {
             let s = r.text.dropFirst(3).trimmingCharacters(in: .whitespaces)
