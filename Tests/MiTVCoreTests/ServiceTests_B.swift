@@ -920,7 +920,7 @@ extension ServiceTests_B {
             let box = DeleteBox()
             service.deleteEntries([a], progress: { _, _, _ in }) { box.set($0) }
             waitMain("不支持返回") { box.done }
-            if case .unsupported = box.error {} else { assertTrue(false, "不支持删除 → unsupported 错误") }
+            if let err = box.error as? EngineError, case .unsupported = err {} else { assertTrue(false, "不支持删除 → unsupported 错误") }
             assertEqual(engine.deleteCalls.count, 0, "不支持时不发起 DELE")
         }
 
@@ -944,7 +944,7 @@ extension ServiceTests_B {
             let box = DeleteBox()
             service.deleteEntries([a], progress: { _, _, _ in }) { box.set($0) }
             waitMain("未连接返回") { box.done }
-            if case .notConnected = box.error {} else { assertTrue(false, "未连接 → notConnected 错误") }
+            if let err = box.error as? EngineError, case .notConnected = err {} else { assertTrue(false, "未连接 → notConnected 错误") }
             assertEqual(engine.deleteCalls.count, 0, "未连接不发起 DELE")
         }
     }
