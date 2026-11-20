@@ -46,9 +46,9 @@
 | STOR 现有子目录 | ✅ | 智能分流可行 |
 | 文件名编码 | **GBK 全通**（中文/`[]`/空格/全角标点）；UTF-8 写入成功但电视端乱码 | 控制通道与文件名默认 GBK（GB18030 超集），探测通过 UTF-8 才切换 |
 | EPSV | ❌ 仅 PASV | 数据连接只用 PASV |
-| SIZE | ✅ 但**拒绝含 `/` 的路径**（550 No directory traversal allowed in SIZE param）；CWD 相对裸名才 213 | 引擎须 CWD 父目录后 SIZE 裸名；现实现发绝对路径 → 真机恒失败（G1 待修） |
+| SIZE | ✅ 但**拒绝含 `/` 的路径**（550 No directory traversal allowed in SIZE param）；CWD 相对裸名才 213 | 引擎已改 CWD 父目录 + SIZE 裸名（G1 修，87e1679）；真机复探 size/appe 转 true、续传链路实测过 |
 | 大文件 | 5.4GB 无碍 | 无 4GB 限制 |
-| DELE / RNFR / RNTO / MLSD | **2026-11-20 实测**：DELE/RNFR 失败 = **450** 泛化文本（Error deleting file / Cannot rename nonexistent file），成功 250；MLSD 502 | 删除策略按探测 deleteFile；**450 现映射 connectionFailed → 真机 remoteNotFound 不触发、tolerateMissing 失效（G2 待修）** |
+| DELE / RNFR / RNTO / MLSD | **2026-11-20 实测**：DELE/RNFR 失败 = **450** 泛化文本（Error deleting file / Cannot rename nonexistent file），成功 250；MLSD 502 | 450+dele/rnfr/rnto 映射 ioError；补删缺席由服务层 LIST 确认（G2 修，8e1516b） |
 
 ## 3. 模块地图与所有权（并行不相交）
 

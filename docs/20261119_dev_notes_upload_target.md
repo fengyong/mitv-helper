@@ -55,7 +55,7 @@ DEV-NOTES-STATUS: DONE
 - ~~真机 GBK 中文目录指定与上传往返~~ ✅ 实测过（`/电视剧` 列表解码+上传+下载 cmp 一致+引擎 GBK 删除）
 - ~~真机 caps.mkdir=false 隐藏确认~~ 当前电视 mkdir=true → 按钮应**显示**（能力驱动正确）；false 态由 mock 走查覆盖
 - ~~上传到这里批级落点真机核对~~ 协议层 ✅（mitvctl upload --to /电视剧 落盘核对）；App 批级 UI 落点仍待人工
-- **新增待修 G1/G2**（引擎存量问题，真机暴露）：SIZE 绝对路径恒 550 → 续传/尺寸探测真机失效；DELE/RNFR 失败 450 映射 connectionFailed → tolerateMissing 真机失效
+- ~~新增待修 G1/G2~~ ✅ 已修（87e1679 / 8e1516b，2026-11-20）：SIZE CWD+裸名、450→ioError+补删 LIST 确认；真机复探与续传链路实测过
 
 **人工（headless 快照覆盖不到的交互/观感）**
 - chip 悬停 tooltip 完整层级（D4）；chip 点击打开选择器
