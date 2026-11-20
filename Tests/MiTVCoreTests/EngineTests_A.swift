@@ -26,6 +26,17 @@ enum EngineTests_A {
         let p5 = FTPPASVParser.parse("500 PASV not understood")
         assertTrue(p5 == nil, "非 227 文本返回 nil")
 
+        // MARK: SIZE 路径拆分（SwiFTP 拒绝含 / 的 SIZE 参数，550 traversal）
+        let sz1 = FTPPath.sizeSplit("/mitv.bin")
+        assertEqual(sz1.dir, "/", "SIZE 拆分：根级文件父目录 = /（免 CWD）")
+        assertEqual(sz1.name, "mitv.bin", "SIZE 拆分：根级裸名")
+        let sz2 = FTPPath.sizeSplit("/Movies/a.mp4")
+        assertEqual(sz2.dir, "/Movies", "SIZE 拆分：嵌套父目录")
+        assertEqual(sz2.name, "a.mp4", "SIZE 拆分：嵌套裸名")
+        let sz3 = FTPPath.sizeSplit("/电视剧/庆余年2/e01.mp4")
+        assertEqual(sz3.dir, "/电视剧/庆余年2", "SIZE 拆分：GBK 多级父目录")
+        assertEqual(sz3.name, "e01.mp4", "SIZE 拆分：GBK 裸名")
+
         // MARK: LIST 解析（unix ls -l 风格）
 
         let unix = FTPListParser.parse([
