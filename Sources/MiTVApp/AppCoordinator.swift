@@ -426,6 +426,9 @@ final class AppCoordinator: NSObject {
                 }
                 self.heartbeatStatus = .connected
                 self.heartbeat.start()
+                // 连接就绪：放行启动恢复的等待项 + 恢复断线暂停 + 自动重试连接类失败项
+                // （启动时队列已按「等待连接」挂起，不与能力探测并发抢连接，review A1/A2）
+                self.queue.connectionReady()
                 self.refreshHeader()
                 self.updateStatusBar()
                 if !silent { self.showToast("已连接电视") }
@@ -714,7 +717,15 @@ final class AppCoordinator: NSObject {
                               after: @escaping () -> Void, onFullyDeleted: (() -> Void)? = nil) {
         let total = filesToDelete.count
         showToast("正在移除 \(total) 项…")
-        files.deleteEntries(filesToDelete, tolerateMissing: tolerateMissing, progress: { _, _, _ in }) { [weak self] result in
+        // 长列表删除每项一个连接往返，没有进度会像卡死：节流更新进度（review B3）
+        var lastProgressAt = Date.distantPast
+        files.deleteEntries(filesToDelete, tolerateMissing: tolerateMissing, progress: { [weak self] done, total, _ in
+            guard let self = self, total > 3, done > 0, done < total else { return }
+            let now = Date()
+            guard now.timeIntervalSince(lastProgressAt) >= 1.0 else { return }
+            lastProgressAt = now
+            self.showToast("正在移除 \(done)/\(total) 项…")
+        }) { [weak self] result in
             guard let self = self else { return }
             switch result {
             case .success(let outcome):

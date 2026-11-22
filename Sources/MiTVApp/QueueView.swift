@@ -150,8 +150,13 @@ final class QueueView: NSView {
             if let spd = Fmt.speed(speed), speed > 0 { text += " · \(spd)" }
             if let eta = Fmt.eta(left, bps: speed) { text += " · \(eta)" }
             summaryLabel.stringValue = text
+        } else if let pausedItem = active.first(where: { $0.phase == .paused }) {
+            // 全部暂停（断线自动/用户手动）：旧实现落到「全部完成」误导用户（review B1）
+            summaryLabel.stringValue = pausedItem.autoPaused
+                ? "电视连接不上 · 传输已暂停，重连后自动继续"
+                : "已全部暂停"
         } else if active.contains(where: { $0.isBusy }) {
-            summaryLabel.stringValue = "等待电视连接，全部暂停中…"
+            summaryLabel.stringValue = "等待连接电视 · 连上后自动开始"
         } else {
             summaryLabel.stringValue = snapshot.isEmpty ? "队列为空" : "全部完成"
         }

@@ -85,9 +85,12 @@ final class QueueService {
             where !members.isEmpty && members.allSatisfy({ $0.phase.isTerminal }) {
                 batchNotified.insert(b)
             }
+            // 恢复项先等连接就绪再调度（协调器连接成功后 connectionReady() 放行）：
+            // 上次退出常因电视关机/断线，此刻直接跑只会对 stale endpoint 逐项判失败，
+            // 也与能力探测并发争抢嵌入式服务器的有限连接（review A1）
+            hold = .disconnected
             stateQ.async { [weak self] in
                 self?.notifyChange()
-                self?.scheduleIfNeeded()
             }
         }
     }
@@ -243,13 +246,29 @@ final class QueueService {
         }
     }
 
-    /// 重连成功：恢复因断线暂停的任务
-    func autoResumeAfterReconnect() {
+    /// 重连成功（心跳驱动）：恢复因断线暂停的任务。仅断线流程置过 hold 才生效
+    func autoResumeAfterReconnect() { connectionReady(onlyIfHeld: true) }
+
+    /// 连接就绪（首连成功/手动重连/引擎切换后重连）：放行启动恢复的等待项 +
+    /// 恢复断线暂停 + 自动重试连接类失败项。只解除 .disconnected——
+    /// 用户「全部暂停」（hold=.user）不得被重连悄悄解除
+    func connectionReady() { connectionReady(onlyIfHeld: false) }
+
+    private func connectionReady(onlyIfHeld: Bool) {
         stateQ.sync {
-            guard hold == .disconnected else { return }
-            hold = .none
-            for i in items.indices where items[i].phase == .paused && items[i].autoPaused {
-                items[i] = QueueStateMachine.apply(.resume, to: items[i])
+            let wasDisconnected = hold == .disconnected
+            if onlyIfHeld {
+                guard wasDisconnected else { return }
+            }
+            if wasDisconnected { hold = .none }
+            for i in items.indices {
+                if wasDisconnected, items[i].phase == .paused, items[i].autoPaused {
+                    items[i] = QueueStateMachine.apply(.resume, to: items[i])
+                } else if items[i].phase == .failed, items[i].connectionDropped == true {
+                    // 连接类失败（心跳判掉线前的窗口期/启动抢跑）：重连即自动重试，
+                    // 不再要求用户对着一排失败项逐个点「重试」（review A2）
+                    items[i] = QueueStateMachine.apply(.retry, to: items[i])
+                }
             }
             persistLocked(force: true)
             notifyChange()
@@ -758,11 +777,12 @@ final class QueueService {
                                   })
     }
 
-    private func applyEngineEvent(_ event: QueueEvent, id: String) {
+    private func applyEngineEvent(_ event: QueueEvent, id: String, connectionDropped: Bool = false) {
         guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
         let before = items[idx].phase
         items[idx] = QueueStateMachine.apply(event, to: items[idx])
         if items[idx].phase != before || event.isProgress {
+            if connectionDropped { items[idx].connectionDropped = true }
             // 终态必须立即落盘：进度事件可节流，但 complete/fail 若也被节流窗口吞掉，
             // app 被杀后重启会从陈旧的 queue.json 恢复出错误状态
             persistLocked(force: items[idx].phase.isTerminal)
@@ -782,11 +802,14 @@ final class QueueService {
 
     private func finishWithEngineError(id: String, error: Error) {
         let reason = error.localizedDescription
+        // 连接类失败（电视离线/断连/超时）标记 connectionDropped：重连成功后自动重试（review A2）
+        var dropped = false
+        if case EngineError.connectionFailed = error { dropped = true }
         if case EngineError.aborted = error {
             // 引擎中断来自句柄取消（暂停/取消已先行改状态）；若状态仍在传输中（异常中断）标记失败
             applyEngineEvent(.fail(reason: "传输中断，可重试"), id: id)
         } else {
-            applyEngineEvent(.fail(reason: reason), id: id)
+            applyEngineEvent(.fail(reason: reason), id: id, connectionDropped: dropped)
         }
     }
 

@@ -393,7 +393,8 @@ final class MockEngine: TransferEngine {
     }
 }
 
-/// 默认工厂：App 默认走 Mock（UserDefaults `useMockEngine`，默认 true），主控集成时切真实引擎。
+/// 默认工厂：App 走 Mock 还是真实引擎由 UserDefaults `useMockEngine` 决定（默认 false = 真实引擎，
+/// AppCoordinator.startup 注册），设置页「演示模式」即时切换。
 final class MockEngineFactory: TransferEngineFactory {
     func makeEngine() -> TransferEngine { MockEngineHolder.shared.engine }
 }

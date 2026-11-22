@@ -12,6 +12,8 @@ enum ServiceTests_B {
         testSoftDeletePolicy()
         testTVStoreRoundTrip()
         testQueueServiceIntegration()
+        testStartupWaitsForConnection()
+        testReconnectAutoRetryDropped()
         testUploadCollision()
         testBrowseFilter()
         testEmptyDiskFallback()
@@ -118,8 +120,20 @@ enum ServiceTests_B {
         var it2 = it
         it2.phase = .failed
         it2.failureReason = "电视拒绝写入"
+        it2.connectionDropped = true
         let back2 = (try! dec.decode([QueueItem].self, from: try! enc.encode([it2]))).first!
         assertEqual(back2.failureReason, "电视拒绝写入", "失败原因往返")
+        assertEqual(back2.connectionDropped, Optional<Bool>.some(true), "connectionDropped 往返")
+
+        // 旧版本 queue.json（无 connectionDropped 字段）必须可解码：Optional 字段缺 key 解码为 nil
+        let legacyJSON = """
+        [{"id":"x","direction":"upload","kind":"video","localPath":"/tmp/a.mp4","displayName":"a.mp4",
+        "sizeBytes":100,"phase":"queued","bytes":0,"bytesPerSecond":0,"needsNameMapping":false,
+        "autoPaused":false,"batchId":"b","addedAt":"2026-11-19T12:00:00Z"}]
+        """.data(using: .utf8)!
+        let legacy = (try! dec.decode([QueueItem].self, from: legacyJSON)).first!
+        assertTrue(legacy.connectionDropped == nil, "旧 JSON 缺 connectionDropped 解码为 nil（向后兼容）")
+        assertEqual(legacy.displayName, "a.mp4", "旧 JSON 其余字段完整")
     }
 
     // MARK: - 智能分流
@@ -240,6 +254,8 @@ enum ServiceTests_B {
         var hangUploads = false
         /// true 时 upload 以失败收场
         var failUploads = false
+        /// 失败时使用的错误（默认 connectionFailed；连接类/非连接类失败自动重试测试用）
+        var failUploadsError: EngineError?
         var pendingUploadCompletions: [(Result<Int64, Error>) -> Void] = []
         /// list 返回的目录内容（重名判定测试用）
         var dirEntries: [FTPFileEntry] = [FTPFileEntry(path: "/Movies", name: "Movies", isDirectory: true)]
@@ -288,7 +304,7 @@ enum ServiceTests_B {
             lock.unlock()
             if !hang {
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.02) {
-                    completion(fail ? .failure(EngineError.connectionFailed("模拟断线")) : .success(1))
+                    completion(fail ? .failure(self.failUploadsError ?? EngineError.connectionFailed("模拟断线")) : .success(1))
                 }
             }
         }
@@ -494,6 +510,94 @@ enum ServiceTests_B {
         let restoredItem = restored.snapshot().first { $0.phase == .queued }
         assertTrue(restoredItem != nil, "running 项恢复为 queued（等待续传）")
         assertEqual(restoredItem?.displayName, f4.lastPathComponent, "恢复项信息完整")
+    }
+
+    // MARK: - 启动恢复等待连接（review A1）
+
+    static func testStartupWaitsForConnection() {
+        print("· 启动恢复项等待连接就绪再调度")
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-startup-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let f = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-startup-\(UUID().uuidString).mp4")
+        try? Data(repeating: 7, count: 16).write(to: f)
+        defer { try? FileManager.default.removeItem(at: f) }
+
+        // 预置上次会话遗留的 queue.json（重启时电视多半已关机）
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var leftover = QueueItem(direction: .upload, kind: .video, localPath: f.path,
+                                 displayName: f.lastPathComponent, sizeBytes: 16)
+        leftover.phase = .queued
+        let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+        try! enc.encode([leftover]).write(to: dir.appendingPathComponent("queue.json"))
+
+        let engine = InlineEngine()
+        let caps = Capabilities(appeResume: true, deleteFile: true, rename: true, sizeCommand: true)
+        let queue = QueueService(engineProvider: { engine },
+                                 endpointProvider: { FTPEndpoint(host: "mock") },
+                                 capabilitiesProvider: { caps },
+                                 persistenceDirectory: dir,
+                                 concurrency: 2, resumeOnStart: true)
+        // 恢复项不抢跑：等连接就绪（协调器 connect 成功后 connectionReady），电视离线时不再逐项判失败
+        Thread.sleep(forTimeInterval: 0.4)
+        assertEqual(engine.uploadCalls.count, 0, "连接就绪前不发起任何上传")
+        assertEqual(engine.listCalls, 0, "连接就绪前不做智能分流 LIST")
+        assertEqual(queue.snapshot().first?.phase, .queued, "恢复项保持 queued（不是 failed）")
+
+        // 连接就绪（首连成功）→ 放行调度 → 正常完成
+        queue.connectionReady()
+        waitUntil("连接就绪后恢复项完成") { queue.snapshot().first?.phase == .completed }
+        assertEqual(engine.uploadCalls.count, 1, "就绪后恰好一次上传")
+    }
+
+    // MARK: - 重连自动重试连接类失败（review A2）
+
+    static func testReconnectAutoRetryDropped() {
+        print("· 重连自动重试连接类失败项")
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-retry-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let f1 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-retry-a-\(UUID().uuidString).mp4")
+        try? Data(repeating: 0, count: 10).write(to: f1)
+        defer { try? FileManager.default.removeItem(at: f1) }
+        let f2 = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mitv-retry-b-\(UUID().uuidString).mp4")
+        try? Data(repeating: 1, count: 10).write(to: f2)
+        defer { try? FileManager.default.removeItem(at: f2) }
+
+        let engine = InlineEngine()
+        let caps = Capabilities(appeResume: true, deleteFile: true, rename: true, sizeCommand: true)
+        let queue = QueueService(engineProvider: { engine },
+                                 endpointProvider: { FTPEndpoint(host: "mock") },
+                                 capabilitiesProvider: { caps },
+                                 persistenceDirectory: dir,
+                                 concurrency: 1, resumeOnStart: true)
+
+        // 1) 连接类失败（心跳判掉线前的窗口期）→ 标记 connectionDropped
+        engine.failUploads = true
+        _ = queue.addUploads([f1])
+        waitUntil("连接失败可见") { queue.snapshot().first?.phase == .failed }
+        assertTrue(queue.snapshot().first?.connectionDropped == true, "连接类失败已标记 connectionDropped")
+
+        // 2) 断线（心跳掉线整体暂停）→ 重连成功 → 自动重试并完成（无需手动逐项重试）
+        queue.autoPauseForDisconnect()
+        engine.failUploads = false
+        queue.autoResumeAfterReconnect()
+        waitUntil("重连后自动重试完成") { queue.snapshot().first?.phase == .completed }
+        assertEqual(engine.uploadCalls.count, 2, "自动重试恰好再调一次引擎")
+        assertTrue(engine.uploadCalls[1].resume, "自动重试=同任务续传 → APPE（远端半截是本任务前缀）")
+
+        // 3) 非连接类失败（如磁盘满）不得被自动重试
+        engine.failUploads = true
+        engine.failUploadsError = EngineError.ioError("磁盘满")
+        _ = queue.addUploads([f2])
+        waitUntil("非连接失败可见") { queue.snapshot().first(where: { $0.localPath == f2.path })?.phase == .failed }
+        let failedID = queue.snapshot().first { $0.localPath == f2.path }!.id
+        let callsBeforeResume = engine.uploadCalls.count // 含 f2 的首次失败调用
+        queue.autoPauseForDisconnect()
+        engine.failUploads = false
+        engine.failUploadsError = nil
+        queue.autoResumeAfterReconnect()
+        Thread.sleep(forTimeInterval: 0.3)
+        assertEqual(queue.snapshot().first { $0.id == failedID }?.phase, .failed, "非连接类失败不自动重试（等用户手动重试）")
+        assertEqual(engine.uploadCalls.count, callsBeforeResume, "引擎未被再次调用")
     }
 }
 

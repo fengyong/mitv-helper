@@ -72,6 +72,9 @@ struct QueueItem: Codable, Equatable {
     var needsNameMapping: Bool
     /// 相同文件判定后跳过上传的原因（completed 且非空 = 未实际传输）
     var skippedReason: String?
+    /// 失败原因为连接类（电视离线/断连）：重连成功后自动重试（review A2）。
+    /// Optional 兼容旧 queue.json（缺 key 解码为 nil）
+    var connectionDropped: Bool?
     /// 一次批量入队的分组 id（全部完成后发整队完成通知）
     var batchId: String
     var addedAt: Date
@@ -101,6 +104,7 @@ struct QueueItem: Codable, Equatable {
         self.bytesPerSecond = 0
         self.needsNameMapping = false
         self.skippedReason = nil
+        self.connectionDropped = nil
         self.batchId = batchId
         self.addedAt = addedAt
         self.finishedAt = nil
@@ -173,6 +177,7 @@ enum QueueStateMachine {
             it.bytes = 0
             it.bytesPerSecond = 0
             it.autoPaused = false
+            it.connectionDropped = nil
         case .fail(let reason):
             guard it.phase == .connecting || it.phase == .running else { return item }
             it.phase = .failed
